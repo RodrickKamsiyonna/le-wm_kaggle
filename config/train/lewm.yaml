@@ -5,7 +5,7 @@ defaults:
 output_model_name: lewm
 subdir: ${hydra:job.id}
 
-num_workers: 6
+num_workers: 2
 train_split: 0.9
 seed: 3072
 img_size: 224
@@ -21,7 +21,7 @@ trainer:
   gradient_clip_val: 1.0
 
 loader:
-  batch_size: 128
+  batch_size: 64
   num_workers: ${num_workers}
   persistent_workers: True
   prefetch_factor: 3
