@@ -164,8 +164,6 @@ def run(cfg):
     with open(run_dir / "config.yaml", "w") as f:
         OmegaConf.save(cfg, f)
 
-from lightning.pytorch.callbacks import ModelCheckpoint
-
     object_dump_callback = ModelCheckpoint(
         dirpath=run_dir,
         filename=f"{cfg.output_model_name}_step{{step}}",
