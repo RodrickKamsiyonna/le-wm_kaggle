@@ -8,6 +8,7 @@ import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
 from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import ModelCheckpoint
 from omegaconf import OmegaConf, open_dict
 
 from jepa import JEPA
@@ -163,8 +164,14 @@ def run(cfg):
     with open(run_dir / "config.yaml", "w") as f:
         OmegaConf.save(cfg, f)
 
-    object_dump_callback = ModelObjectCallBack(
-        dirpath=run_dir, filename=cfg.output_model_name, epoch_interval=1,
+from lightning.pytorch.callbacks import ModelCheckpoint
+
+    object_dump_callback = ModelCheckpoint(
+        dirpath=run_dir,
+        filename=f"{cfg.output_model_name}_step{{step}}",
+        every_n_train_steps=500,   
+        save_top_k=1,       
+        save_last=False,
     )
 
     trainer = pl.Trainer(
