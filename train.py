@@ -79,7 +79,7 @@ def lejepa_forward(self, batch, stage, cfg):
         act_gamma_emb = self.model.action_encoder(act_gamma)
 
         pred_emb_corrupted = self.model.predict(ctx_emb, act_gamma_emb)
-        energy = (pred_emb_corrupted - tgt_emb.detach()).pow(2).mean()
+        energy = -(pred_emb_corrupted - tgt_emb.detach()).pow(2).mean()
 
         grad_energy = torch.autograd.grad(
             outputs=energy,
