@@ -50,7 +50,7 @@ def lejepa_forward(self, batch, stage, cfg):
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
 
-    eqm_lambda = cfg.loss.get("eqm_lambda", 4.0)
+    eqm_lambda = cfg.loss.get("eqm_lambda", 1.0)
     eqm_weight = cfg.loss.get("eqm_pred_weight", 1.0)
 
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
@@ -76,8 +76,7 @@ def lejepa_forward(self, batch, stage, cfg):
 
         act_gamma = (gamma * ctx_actions_raw.detach() + (1 - gamma) * eps).requires_grad_(True)
 
-        B, T, D = act_gamma.shape
-        act_gamma_emb = self.model.action_encoder(act_gamma.reshape(B * T, D)).reshape(B, T, -1)
+        act_gamma_emb = self.model.action_encoder(act_gamma)
 
         pred_emb_corrupted = self.model.predict(ctx_emb.detach(), act_gamma_emb)
         energy = (pred_emb_corrupted - tgt_emb.detach()).pow(2).mean()
