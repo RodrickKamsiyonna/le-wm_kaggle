@@ -78,7 +78,7 @@ def lejepa_forward(self, batch, stage, cfg):
 
         act_gamma_emb = self.model.action_encoder(act_gamma)
 
-        pred_emb_corrupted = self.model.predict(ctx_emb.detach(), act_gamma_emb)
+        pred_emb_corrupted = self.model.predict(ctx_emb, act_gamma_emb)
         energy = (pred_emb_corrupted - tgt_emb.detach()).pow(2).mean()
 
         grad_energy = torch.autograd.grad(
@@ -93,7 +93,14 @@ def lejepa_forward(self, batch, stage, cfg):
     output["pred_loss_eqm"] = (grad_energy - target_grad).pow(2).mean()
 
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
-    output["loss"] = eqm_weight * output["pred_loss_eqm"] + lambd * output["sigreg_loss"]
+    
+    mse_weight = cfg.loss.get("mse_weight", 1.0) 
+    
+    output["loss"] = (
+        mse_weight * output["pred_loss_mse"] +  # Anchors the energy absolute value
+        eqm_weight * output["pred_loss_eqm"] +  # Shapes the energy gradient
+        lambd * output["sigreg_loss"]           # Regularizes embeddings
+    )
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     losses_dict[f"{stage}/pred_energy"] = output["pred_loss_energy"]
