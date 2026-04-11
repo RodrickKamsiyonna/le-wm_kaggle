@@ -70,23 +70,24 @@ def lejepa_forward(self, batch, stage, cfg):
     ctx_actions_raw = batch["action"][:, :ctx_len]
     B = ctx_actions_raw.shape[0]
 
-    gamma = torch.rand(B, 1, 1, device=ctx_actions_raw.device, dtype=ctx_actions_raw.dtype)
-    eps = torch.randn_like(ctx_actions_raw)
+    with torch.enable_grad():
+        gamma = torch.rand(B, 1, 1, device=ctx_actions_raw.device, dtype=ctx_actions_raw.dtype)
+        eps = torch.randn_like(ctx_actions_raw)
 
-    act_gamma = (gamma * ctx_actions_raw.detach() + (1 - gamma) * eps).requires_grad_(True)
+        act_gamma = (gamma * ctx_actions_raw.detach() + (1 - gamma) * eps).requires_grad_(True)
 
-    corrupted_batch = {**batch, "action": torch.cat([act_gamma, batch["action"][:, ctx_len:]], dim=1)}
-    corrupted_output = self.model.encode(corrupted_batch)
-    act_gamma_emb = corrupted_output["act_emb"][:, :ctx_len]
+        corrupted_batch = {**batch, "action": torch.cat([act_gamma, batch["action"][:, ctx_len:]], dim=1)}
+        corrupted_output = self.model.encode(corrupted_batch)
+        act_gamma_emb = corrupted_output["act_emb"][:, :ctx_len]
 
-    pred_emb_corrupted = self.model.predict(ctx_emb.detach(), act_gamma_emb)
-    energy = (pred_emb_corrupted - tgt_emb.detach()).pow(2).mean()
+        pred_emb_corrupted = self.model.predict(ctx_emb.detach(), act_gamma_emb)
+        energy = (pred_emb_corrupted - tgt_emb.detach()).pow(2).mean()
 
-    grad_energy = torch.autograd.grad(
-        outputs=energy,
-        inputs=act_gamma,
-        create_graph=True,
-    )[0]
+        grad_energy = torch.autograd.grad(
+            outputs=energy,
+            inputs=act_gamma,
+            create_graph=True,
+        )[0]
 
     c_gamma = eqm_lambda * (1 - gamma)
     target_grad = (eps - ctx_actions_raw.detach()) * c_gamma
