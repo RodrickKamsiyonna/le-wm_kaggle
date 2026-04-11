@@ -16,7 +16,7 @@ from module import ARPredictor, Embedder, MLP, SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
 
 
-def lejepa_forward(self, batch, stage, cfg):
+def lejepa_forward1(self, batch, stage, cfg):
     """encode observations, predict next states, compute losses."""
 
     ctx_len = cfg.wm.history_size
@@ -44,7 +44,63 @@ def lejepa_forward(self, batch, stage, cfg):
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
 
+def lejepa_forward(self, batch, stage, cfg):
+    """encode observations, predict next states, compute losses."""
+    ctx_len = cfg.wm.history_size
+    n_preds = cfg.wm.num_preds
+    lambd = cfg.loss.sigreg.weight
 
+    eqm_lambda = cfg.loss.get("eqm_lambda", 1.0)
+    eqm_weight = cfg.loss.get("eqm_pred_weight", 1.0)
+
+    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+
+    output = self.model.encode(batch)
+    emb = output["emb"]
+    act_emb = output["act_emb"]
+    ctx_emb = emb[:, :ctx_len]
+    ctx_act = act_emb[:, :ctx_len]
+    tgt_emb = emb[:, n_preds:]
+
+    pred_emb = self.model.predict(ctx_emb, ctx_act)
+    mse_loss = (pred_emb - tgt_emb).pow(2).mean()
+    output["pred_loss_mse"] = mse_loss
+    output["pred_loss_energy"] = mse_loss.detach()
+
+    ctx_actions_raw = batch["action"][:, :ctx_len]
+    B = ctx_actions_raw.shape[0]
+
+    gamma = torch.rand(B, 1, 1, device=ctx_actions_raw.device, dtype=ctx_actions_raw.dtype)
+    eps = torch.randn_like(ctx_actions_raw)
+
+    act_gamma = (gamma * ctx_actions_raw.detach() + (1 - gamma) * eps).requires_grad_(True)
+
+    corrupted_batch = {**batch, "action": torch.cat([act_gamma, batch["action"][:, ctx_len:]], dim=1)}
+    corrupted_output = self.model.encode(corrupted_batch)
+    act_gamma_emb = corrupted_output["act_emb"][:, :ctx_len]
+
+    pred_emb_corrupted = self.model.predict(ctx_emb.detach(), act_gamma_emb)
+    energy = (pred_emb_corrupted - tgt_emb.detach()).pow(2).mean()
+
+    grad_energy = torch.autograd.grad(
+        outputs=energy,
+        inputs=act_gamma,
+        create_graph=True,
+    )[0]
+
+    c_gamma = eqm_lambda * (1 - gamma)
+    target_grad = (eps - ctx_actions_raw.detach()) * c_gamma
+
+    output["pred_loss_eqm"] = (grad_energy - target_grad).pow(2).mean()
+
+    output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
+    output["loss"] = eqm_weight * output["pred_loss_eqm"] + lambd * output["sigreg_loss"]
+
+    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+    losses_dict[f"{stage}/pred_energy"] = output["pred_loss_energy"]
+    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    return output
+    
 def get_latest_checkpoint(run_dir: Path, model_name: str):
     """Find the latest step checkpoint for auto-resume."""
     ckpts = list(run_dir.glob(f"{model_name}_step*.ckpt"))
