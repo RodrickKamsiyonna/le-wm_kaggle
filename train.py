@@ -49,57 +49,52 @@ def lejepa_forward(self, batch, stage, cfg):
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
-
     eqm_lambda = cfg.loss.get("eqm_lambda", 1.0)
     eqm_weight = cfg.loss.get("eqm_pred_weight", 1.0)
 
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
-
     output = self.model.encode(batch)
-    emb = output["emb"]
-    act_emb = output["act_emb"]
-    ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, :ctx_len]
-    tgt_emb = emb[:, n_preds:]
 
+    emb = output["emb"]
+    ctx_emb = emb[:, :ctx_len]
+    tgt_emb = emb[:, n_preds:]
     ctx_actions_raw = batch["action"][:, :ctx_len]
     B = ctx_actions_raw.shape[0]
 
     with torch.enable_grad():
         gamma = torch.rand(B, 1, 1, device=ctx_actions_raw.device, dtype=ctx_actions_raw.dtype)
         eps = torch.randn_like(ctx_actions_raw)
-
         act_gamma = (gamma * ctx_actions_raw.detach() + (1 - gamma) * eps).requires_grad_(True)
 
-        act_gamma_emb = self.model.action_encoder(act_gamma)
+        pred_emb = self.model.predict(ctx_emb, self.model.action_encoder(act_gamma))
 
-        pred_emb = self.model.predict(ctx_emb, act_gamma_emb)
-        energy = (pred_emb - tgt_emb).pow(2).mean()
+        # Per-sample energy: mean over token/embedding dims, keep batch dim -> [B]
+        energy_per_sample = (pred_emb - tgt_emb).pow(2).mean(dim=-1).mean(dim=-1)
 
-        grad_energy = torch.autograd.grad(
-            outputs=energy,
-            inputs=act_gamma,
-            create_graph=True,
-        )[0]
+        # Scalar energy for grad computation (same graph)
+        energy = energy_per_sample.mean()
 
-    c_gamma = eqm_lambda * (1 - gamma)
-    target_grad = (eps - ctx_actions_raw.detach()) * c_gamma
+        grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
 
+    gamma_1d = gamma.squeeze(-1).squeeze(-1)  # [B]
+    target_grad = (eps - ctx_actions_raw.detach()) * eqm_lambda * (1 - gamma)
+
+    output["energy"] = energy
+    output["energy_weighted"] = (gamma_1d * energy_per_sample).mean()
     output["pred_loss_eqm"] = (grad_energy - target_grad).pow(2).mean()
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
-    output["energy"]  = energy
-    output["energy_weighted"] = gamma*energy
-    
     output["loss"] = (
-        gamma * output["energy"] +              # Anchors the energy absolute value
-        eqm_weight * output["pred_loss_eqm"] +  # Shapes the energy gradient
-        lambd * output["sigreg_loss"]           # Regularizes embeddings
+        output["energy_weighted"] +
+        eqm_weight * output["pred_loss_eqm"] +
+        lambd * output["sigreg_loss"]
     )
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
-    losses_dict[f"{stage}/energy"] = output["energy"]
+    losses_dict[f"{stage}/energy"] = output["energy"].detach()
+    losses_dict[f"{stage}/energy_weighted"] = output["energy_weighted"].detach()
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
+    
     
 def get_latest_checkpoint(run_dir: Path, model_name: str):
     """Find the latest step checkpoint for auto-resume."""
