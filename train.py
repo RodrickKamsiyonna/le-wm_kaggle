@@ -64,10 +64,13 @@ def lejepa_forward(self, batch, stage, cfg):
         act_gamma = (gamma * ctx_actions_raw.detach() + (1 - gamma) * eps).requires_grad_(True)
         pred_emb = self.model.predict(ctx_emb, self.model.action_encoder(act_gamma))
 
-        # Per-sample energy: SUM over token/embedding dims -> [B]
-        energy_per_sample = (pred_emb - tgt_emb).pow(2).sum(dim=-1).sum(dim=-1)
+        # Energy per timestep: sum over embedding dim -> [B, T]
+        energy_per_timestep = (pred_emb - tgt_emb).pow(2).sum(dim=-1)
 
-        # Scalar energy: mean over batch (for grad computation + logging)
+        # Per-sample energy: average over timesteps -> [B]
+        energy_per_sample = energy_per_timestep.mean(dim=-1)
+
+        # Scalar energy: average over batch
         energy = energy_per_sample.mean()
 
         grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
@@ -75,9 +78,8 @@ def lejepa_forward(self, batch, stage, cfg):
     gamma_1d = gamma.squeeze(-1).squeeze(-1)  # [B]
     target_grad = (eps - ctx_actions_raw.detach()) * eqm_lambda * (1 - gamma)
 
-    # Gamma-weighted MSE: weight each sample's squared error by its gamma, then mean over all dims
-    per_sample_mse = (pred_emb - tgt_emb).pow(2).mean(dim=-1).mean(dim=-1)  # [B]
-    output["pred_loss"] = (gamma_1d * per_sample_mse).mean()
+    # Gamma-weighted MSE pred loss
+    output["pred_loss"] = (gamma_1d * energy_per_sample).mean()
 
     # EQM loss: sum over action dims per sample, then mean over batch
     pred_loss_eqm_per_sample = (grad_energy - target_grad).pow(2).sum(dim=-1).sum(dim=-1)
@@ -94,7 +96,6 @@ def lejepa_forward(self, batch, stage, cfg):
     losses_dict[f"{stage}/energy"] = output["energy"].detach()
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
-    
     
 def get_latest_checkpoint(run_dir: Path, model_name: str):
     """Find the latest step checkpoint for auto-resume."""
