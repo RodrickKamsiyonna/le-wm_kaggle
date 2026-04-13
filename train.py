@@ -90,7 +90,7 @@ def lejepa_forward(self, batch, stage, cfg):
     output["loss"] = (
         output["pred_loss"] +
         eqm_weight * output["pred_loss_eqm"] +
-        lambd * output["sigreg_loss"]
+        output["sigreg_loss"]
     )
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     losses_dict[f"{stage}/energy"] = output["energy"].detach()
