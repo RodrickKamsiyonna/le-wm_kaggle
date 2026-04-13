@@ -49,7 +49,7 @@ def lejepa_forward(self, batch, stage, cfg):
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
-    eqm_lambda = cfg.loss.get("eqm_lambda", 1.0)
+    eqm_lambda = cfg.loss.get("eqm_lambda", 4.0)
     eqm_weight = cfg.loss.get("eqm_pred_weight", 1.0)
 
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
