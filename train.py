@@ -66,15 +66,15 @@ def lejepa_forward(self, batch, stage, cfg):
         act_gamma = (gamma * ctx_actions_raw.detach() + (1 - gamma) * eps).requires_grad_(True)
         pred_emb = self.model.predict(ctx_emb, self.model.action_encoder(act_gamma))
 
-    se_pred = torch.nn.functional.mse_loss(pred_emb, tgt_emb, reduction='none')
-    mse_per_sample = se_pred.mean(dim=(1, 2))
-    gamma_1d = gamma.view(B)
-    output["pred_loss"] = (mse_per_sample * gamma_1d).mean()
-
-    energy = se_pred.sum(dim=-1).mean() 
+        se_pred = torch.nn.functional.mse_loss(pred_emb, tgt_emb, reduction='none')
+        mse_per_sample = se_pred.mean(dim=(1, 2))
+        gamma_1d = gamma.view(B)
+        output["pred_loss"] = (mse_per_sample * gamma_1d).mean()
     
-    grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
-    target_grad = (eps - ctx_actions_raw.detach()) * eqm_lambda * (1 - gamma)
+        energy = se_pred.sum(dim=-1).mean() 
+        
+        grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
+        target_grad = (eps - ctx_actions_raw.detach()) * eqm_lambda * (1 - gamma)
     output["pred_loss_eqm"] = torch.nn.functional.mse_loss(grad_energy, target_grad)
 
     output["energy"] = energy.detach()
