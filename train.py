@@ -45,55 +45,49 @@ def lejepa_forward1(self, batch, stage, cfg):
     return output
 
 def lejepa_forward(self, batch, stage, cfg):
-    """encode observations, predict next states, compute losses."""
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
     eqm_lambda = cfg.loss.get("eqm_lambda", 1.0)
     eqm_weight = cfg.loss.get("eqm_pred_weight", 1.0)
+
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
     output = self.model.encode(batch)
+    
     emb = output["emb"]
     ctx_emb = emb[:, :ctx_len]
     tgt_emb = emb[:, n_preds:]
     ctx_actions_raw = batch["action"][:, :ctx_len]
     B = ctx_actions_raw.shape[0]
+
     with torch.enable_grad():
         gamma = torch.rand(B, 1, 1, device=ctx_actions_raw.device, dtype=ctx_actions_raw.dtype)
         eps = torch.randn_like(ctx_actions_raw)
         act_gamma = (gamma * ctx_actions_raw.detach() + (1 - gamma) * eps).requires_grad_(True)
         pred_emb = self.model.predict(ctx_emb, self.model.action_encoder(act_gamma))
 
-        # Energy per timestep: sum over embedding dim -> [B, T]
-        energy_per_timestep = (pred_emb - tgt_emb).pow(2).sum(dim=-1)
+    se_pred = torch.nn.functional.mse_loss(pred_emb, tgt_emb, reduction='none')
+    mse_per_sample = se_pred.mean(dim=(1, 2))
+    gamma_1d = gamma.view(B)
+    output["pred_loss"] = (mse_per_sample * gamma_1d).mean()
 
-        # Per-sample energy: average over timesteps -> [B]
-        energy_per_sample = energy_per_timestep.mean(dim=-1)
-
-        # Scalar energy: average over batch
-        energy = energy_per_sample.mean()
-
-        grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
-
-    gamma_1d = gamma.squeeze(-1).squeeze(-1)  # [B]
+    energy = se_pred.sum(dim=-1).mean() 
+    
+    grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
     target_grad = (eps - ctx_actions_raw.detach()) * eqm_lambda * (1 - gamma)
+    output["pred_loss_eqm"] = torch.nn.functional.mse_loss(grad_energy, target_grad)
 
-    # Gamma-weighted MSE pred loss
-    output["pred_loss"] = (gamma_1d * energy_per_sample).mean()
-
-    # EQM loss: sum over action dims per sample, then mean over batch
-    pred_loss_eqm_per_sample = (grad_energy - target_grad).pow(2).sum(dim=-1).sum(dim=-1)
-    output["pred_loss_eqm"] = pred_loss_eqm_per_sample.mean()
-
-    output["energy"] = energy
+    output["energy"] = energy.detach()
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
+    
     output["loss"] = (
         output["pred_loss"] +
         eqm_weight * output["pred_loss_eqm"] +
-        output["sigreg_loss"]
+        lambd * output["sigreg_loss"]
     )
+
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
-    losses_dict[f"{stage}/energy"] = output["energy"].detach()
+    losses_dict[f"{stage}/energy"] = output["energy"]
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
     
