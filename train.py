@@ -91,7 +91,7 @@ def lejepa_forward(self, batch, stage, cfg):
 
         target_grad = (eps - ctx_actions_raw.detach()) * eqm_lambda * (1 - gamma)
 
-    output["pred_loss_eqm"] = F.mse_loss(grad_energy, target_grad)
+    output["pred_loss_eqm"] = (grad_energy-target_grad).pow(2).mean()
     output["energy"] = energy.detach()
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
 
