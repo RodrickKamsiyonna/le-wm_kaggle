@@ -49,7 +49,7 @@ def lejepa_forward(self, batch, stage, cfg):
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
     eqm_lambda = cfg.loss.get("eqm_lambda", 1.0)
-    eqm_weight = cfg.loss.get("eqm_pred_weight", 1.0)
+    eqm_weight = cfg.loss.get("eqm_pred_weight", 0.5)
 
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
     output = self.model.encode(batch)
@@ -57,43 +57,41 @@ def lejepa_forward(self, batch, stage, cfg):
     emb = output["emb"]
     act_emb = output["act_emb"]
 
-    ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, :ctx_len]
-    tgt_emb = emb[:, n_preds:]
+    ctx_emb = emb[:, :ctx_len]       
+    ctx_act = act_emb[:, :ctx_len]          
+    tgt_emb = emb[:, n_preds:]     
 
-    # Standard prediction loss (clean actions)
     pred_emb_std = self.model.predict(ctx_emb, ctx_act)
     output["pred_loss"] = (pred_emb_std - tgt_emb).pow(2).mean()
 
-    # ── EQM loss ────────────────────────────────────────────────────────────
-    # Perturb the FUTURE actions (the ones the predictor plans over),
-    # not the context actions that already built ctx_emb.
-    future_actions_raw = batch["action"][:, ctx_len : ctx_len + n_preds]  # (B, n_preds, act_dim)
-    B = future_actions_raw.shape[0]
+    # ── EQM loss ─────────────────────────────────────────────────────────────
+    # Perturb the CONTEXT actions — these are what predict() conditions on.
+    # Gradient of energy w.r.t. act_gamma teaches the model a landscape where
+    # grad_a points from noisy actions back toward the clean ones.
+    ctx_actions_raw = batch["action"][:, :ctx_len] 
+    B = ctx_actions_raw.shape[0]
 
     with torch.enable_grad():
-        gamma = torch.rand(B, 1, 1, device=future_actions_raw.device, dtype=future_actions_raw.dtype)
-        eps = torch.randn_like(future_actions_raw)
+        gamma = torch.rand(B, 1, 1, device=ctx_actions_raw.device, dtype=ctx_actions_raw.dtype)
+        eps = torch.randn_like(ctx_actions_raw)
 
-        # Interpolate between true future action and noise
         act_gamma = (
-            gamma * future_actions_raw.detach() + (1 - gamma) * eps
-        ).requires_grad_(True)
+            gamma * ctx_actions_raw.detach() + (1 - gamma) * eps
+        ).requires_grad_(True)                       # (B, ctx_len, act_dim)
 
-        # Predict from fixed context using the perturbed future actions
-        pred_emb_noisy = self.model.predict(ctx_emb, self.model.action_encoder(act_gamma))
 
-        # Energy: distance of noisy prediction from the true future latents
+        pred_emb_noisy = self.model.predict(
+            ctx_emb.detach(),                       
+            self.model.action_encoder(act_gamma),
+        )
+
         energy = (pred_emb_noisy - tgt_emb).pow(2).sum(dim=-1).mean()
 
         grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
 
-        # Target gradient: points from noisy action back toward clean action
-        # d/d(act_gamma) ||act_gamma - future_actions||^2 ∝ (act_gamma - future_actions)
-        # = (gamma*a + (1-gamma)*eps - a) = (1-gamma)*(eps - a)
-        target_grad = (eps - future_actions_raw.detach()) * eqm_lambda * (1 - gamma)
+        target_grad = (eps - ctx_actions_raw.detach()) * eqm_lambda * (1 - gamma)
 
-    output["pred_loss_eqm"] = (grad_energy-target_grad).pow(2).mean()
+    output["pred_loss_eqm"] = F.mse_loss(grad_energy, target_grad)
     output["energy"] = energy.detach()
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
 
@@ -106,8 +104,8 @@ def lejepa_forward(self, batch, stage, cfg):
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     losses_dict[f"{stage}/energy"] = output["energy"]
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
-
     return output
+    
     
 def get_latest_checkpoint(run_dir: Path, model_name: str):
     """Find the latest step checkpoint for auto-resume."""
