@@ -16,8 +16,47 @@ from module import ARPredictor, Embedder, MLP, SIGReg
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Resumable DataLoader
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ResumableDataLoader(torch.utils.data.DataLoader):
+    """DataLoader that supports state_dict / load_state_dict for mid-epoch resume.
+
+    On checkpoint save, Lightning calls state_dict() and stores the number of
+    batches already consumed this epoch.  On resume, load_state_dict() restores
+    that count and __iter__ silently skips those batches so training picks up
+    exactly where it left off.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._start_idx = 0  # batches already consumed this epoch
+
+    # ── checkpoint interface ──────────────────────────────────────────────────
+    def state_dict(self):
+        return {"start_idx": self._start_idx}
+
+    def load_state_dict(self, state: dict):
+        self._start_idx = state.get("start_idx", 0)
+
+    # ── skip already-seen batches on resume ───────────────────────────────────
+    def __iter__(self):
+        iterator = super().__iter__()
+        for i, batch in enumerate(iterator):
+            if i < self._start_idx:
+                continue          # fast-forward past consumed batches
+            self._start_idx = 0  # clear after the first yielded batch
+            yield batch
+        self._start_idx = 0       # full epoch done — reset for next epoch
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Forward passes
+# ─────────────────────────────────────────────────────────────────────────────
+
 def lejepa_forward1(self, batch, stage, cfg):
-    """encode observations, predict next states, compute losses."""
+    """Encode observations, predict next states, compute losses (baseline)."""
 
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
@@ -44,7 +83,10 @@ def lejepa_forward1(self, batch, stage, cfg):
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
 
+
 def lejepa_forward(self, batch, stage, cfg):
+    """Encode observations, predict next states, compute losses with EQM."""
+
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
@@ -57,18 +99,14 @@ def lejepa_forward(self, batch, stage, cfg):
     emb = output["emb"]
     act_emb = output["act_emb"]
 
-    ctx_emb = emb[:, :ctx_len]       
-    ctx_act = act_emb[:, :ctx_len]          
-    tgt_emb = emb[:, n_preds:]     
+    ctx_emb = emb[:, :ctx_len]
+    ctx_act = act_emb[:, :ctx_len]
+    tgt_emb = emb[:, n_preds:]
 
     pred_emb_std = self.model.predict(ctx_emb, ctx_act)
     output["pred_loss"] = (pred_emb_std - tgt_emb).pow(2).mean()
 
-    # ── EQM loss ─────────────────────────────────────────────────────────────
-    # Perturb the CONTEXT actions — these are what predict() conditions on.
-    # Gradient of energy w.r.t. act_gamma teaches the model a landscape where
-    # grad_a points from noisy actions back toward the clean ones.
-    ctx_actions_raw = batch["action"][:, :ctx_len] 
+    ctx_actions_raw = batch["action"][:, :ctx_len]
     B = ctx_actions_raw.shape[0]
 
     with torch.enable_grad():
@@ -77,21 +115,21 @@ def lejepa_forward(self, batch, stage, cfg):
 
         act_gamma = (
             gamma * ctx_actions_raw.detach() + (1 - gamma) * eps
-        ).requires_grad_(True)                       # (B, ctx_len, act_dim)
-
+        ).requires_grad_(True)                          # (B, ctx_len, act_dim)
 
         pred_emb_noisy = self.model.predict(
-            ctx_emb.detach(),                       
+            ctx_emb.detach(),
             self.model.action_encoder(act_gamma),
         )
 
-        energy = (pred_emb_noisy - tgt_emb).pow(2).sum(dim=-1).mean()
+        # detach tgt_emb: target only, no cross-stream grad-fn kept alive
+        energy = (pred_emb_noisy - tgt_emb.detach()).pow(2).sum(dim=-1).mean()
 
         grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
 
         target_grad = (eps - ctx_actions_raw.detach()) * eqm_lambda * (1 - gamma)
 
-    output["pred_loss_eqm"] = (grad_energy-target_grad).pow(2).mean()
+    output["pred_loss_eqm"] = (grad_energy - target_grad).pow(2).mean()
     output["energy"] = energy.detach()
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
 
@@ -105,32 +143,39 @@ def lejepa_forward(self, batch, stage, cfg):
     losses_dict[f"{stage}/energy"] = output["energy"]
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
-    
-    
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 def get_latest_checkpoint(run_dir: Path, model_name: str):
     """Find the latest step checkpoint for auto-resume."""
     ckpts = list(run_dir.glob(f"{model_name}_step*.ckpt"))
     if not ckpts:
         return None
-    # sort by step number
+
     def extract_step(p):
         try:
             return int(str(p.stem).split("step=")[-1])
-        except:
+        except Exception:
             return -1
+
     latest = max(ckpts, key=extract_step)
     print(f"Auto-resuming from: {latest}")
     return latest
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
 def run(cfg):
-    #########################
-    ##       dataset       ##
-    #########################
 
+    # ── dataset ───────────────────────────────────────────────────────────────
     dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
-    transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
+    transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)]
 
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
@@ -145,16 +190,21 @@ def run(cfg):
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
     train_set, val_set = spt.data.random_split(
-        dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
+        dataset,
+        lengths=[cfg.train_split, 1 - cfg.train_split],
+        generator=rnd_gen,
     )
 
-    train = torch.utils.data.DataLoader(train_set, **cfg.loader, shuffle=True, drop_last=True, generator=rnd_gen)
-    val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
+    # ResumableDataLoader — supports state_dict / load_state_dict so Lightning
+    # can skip already-consumed batches when resuming a mid-epoch checkpoint.
+    train = ResumableDataLoader(
+        train_set, **cfg.loader, shuffle=True, drop_last=True, generator=rnd_gen
+    )
+    val = ResumableDataLoader(
+        val_set, **cfg.loader, shuffle=False, drop_last=False
+    )
 
-    ##############################
-    ##       model / optim      ##
-    ##############################
-
+    # ── model / optimiser ─────────────────────────────────────────────────────
     encoder = spt.backbone.utils.vit_hf(
         cfg.encoder_scale,
         patch_size=cfg.patch_size,
@@ -204,8 +254,8 @@ def run(cfg):
     warmup_steps = int(0.03 * total_steps)
 
     optimizers = {
-        'model_opt': {
-            "modules": 'model',
+        "model_opt": {
+            "modules": "model",
             "optimizer": dict(cfg.optimizer),
             "scheduler": {
                 "type": "LinearWarmupCosineAnnealingLR",
@@ -224,10 +274,7 @@ def run(cfg):
         optim=optimizers,
     )
 
-    ##########################
-    ##       training       ##
-    ##########################
-
+    # ── training ──────────────────────────────────────────────────────────────
     run_dir = Path("/kaggle/working", cfg.get("subdir") or "lewm_run")
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -261,18 +308,17 @@ def run(cfg):
         enable_checkpointing=True,
     )
 
-    # ── Auto-resume from latest step checkpoint if it exists ──
+    # Auto-resume from latest step checkpoint if one exists
     latest_ckpt = get_latest_checkpoint(run_dir, cfg.output_model_name)
 
     manager = spt.Manager(
         trainer=trainer,
         module=world_model,
         data=data_module,
-        ckpt_path=latest_ckpt,  # None if no checkpoint exists, auto-resumes if found
+        ckpt_path=latest_ckpt,  # None → fresh run; path → mid-epoch resume
     )
 
     manager()
-    return
 
 
 if __name__ == "__main__":
