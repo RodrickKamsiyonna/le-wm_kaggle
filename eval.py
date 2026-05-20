@@ -14,7 +14,6 @@ from omegaconf import DictConfig, OmegaConf
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
-from stable_worldmodel.wm import utils as wm_utils
 
 
 def img_transform(cfg):
@@ -351,7 +350,7 @@ def run(cfg: DictConfig):
         # FIX 3: use load_pretrained (same as the CEM eval) so the returned
         # object is the JEPA model with the .encode / .predict / .action_encoder
         # interface that GradientBasedSolver depends on.
-        model = wm_utils.load_pretrained(cfg.policy)
+        model = swm.wm.utils.load_pretrained(cfg.policy)
         model = model.to("cuda")
         model = model.eval()
         model.requires_grad_(False)
