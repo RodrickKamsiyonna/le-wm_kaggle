@@ -319,8 +319,13 @@ def run(cfg: DictConfig):
         cfg.plan_config.horizon * cfg.plan_config.action_block <= cfg.eval.eval_budget
     ), "Planning horizon must be smaller than or equal to eval_budget"
 
+
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
-    world = swm.World(**cfg.world, image_shape=(224, 224))
+    
+    world_kwargs = OmegaConf.to_container(cfg.world, resolve=True)
+    world_kwargs.pop("history_size", None)  # Cleanly drop it if it exists
+    
+    world = swm.World(**world_kwargs, image_shape=(224, 224))
 
     transform = {
         "pixels": img_transform(cfg),
