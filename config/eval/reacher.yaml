@@ -1,6 +1,6 @@
 defaults:
   - launcher: local
-  - solver: cem
+  - solver: gradient  
   - _self_
 
 world:
