@@ -322,10 +322,13 @@ def run(cfg: DictConfig):
 
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
     
-    world_kwargs = OmegaConf.to_container(cfg.world, resolve=True)
-    world_kwargs.pop("history_size", None)  # Cleanly drop it if it exists
-    
-    world = swm.World(**world_kwargs, image_shape=(224, 224))
+    # Extract clean parameters that stable_worldmodel.World explicitly requires
+    world = swm.World(
+        env_name=cfg.world.env_name,
+        num_envs=cfg.world.num_envs,
+        max_episode_steps=cfg.world.max_episode_steps,
+        image_shape=(224, 224)
+    )
 
     transform = {
         "pixels": img_transform(cfg),
