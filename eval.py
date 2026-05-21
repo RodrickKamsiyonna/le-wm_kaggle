@@ -300,9 +300,17 @@ class GradientWorldModelPolicy:
             elif key in self.process:
                 arr = np.array(val, dtype=np.float32).reshape(1, -1)
                 transformed = self.process[key].transform(arr)
-                t = torch.tensor(transformed, dtype=torch.float32)
-                # action encoder expects (batch, seq_len, dim); add seq dim
-                batch[key] = t.unsqueeze(1)   # (1, 1, action_dim)
+                t = torch.tensor(transformed, dtype=torch.float32)  # (1, 2)
+                
+                if key == "action":
+                    # Model action_encoder expects (batch, seq_len, 10):
+                    # action_dim in training = 10 (5 action steps × 2 dims, flattened).
+                    # Repeat/tile the single 2-dim action to fill the 10-dim slot,
+                    # then unsqueeze the sequence dimension.
+                    # Actually: the scaler was fit on 10-dim actions, so reshape correctly:
+                    batch[key] = t.view(1, 1, -1)  # (1, 1, action_dim_as_stored)
+                else:
+                    batch[key] = t.unsqueeze(1)
             else:
                 try:
                     # Safely try to convert to float32 tensor
