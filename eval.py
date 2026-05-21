@@ -354,73 +354,12 @@ def run(cfg: DictConfig):
 
     policy_name = cfg.get("policy", "random")
     if policy_name != "random":
-        import os
-        import json
-        import yaml
-        import torch
-        from omegaconf import OmegaConf
-
         ckpt_path = cfg.policy + "_object.ckpt"
-        loaded_model_config = {}
+        print(f"Loading direct model object from {ckpt_path}...")
         
-        original_resolve = swm.wm.utils._resolve
-        
-        def local_resolve(name, cache_dir):
-            nonlocal loaded_model_config
-            if os.path.exists(ckpt_path):
-                base_dir = os.path.dirname(ckpt_path)
-                print(f"Loading checkpoint from {ckpt_path}...")
-                checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-                
-                # 1. Search for the model config (checks adjacent files or internal checkpoint data)
-                config = None
-                for conf_name in ["config.json", "config.yaml", "hparams.yaml"]:
-                    conf_path = os.path.join(base_dir, conf_name)
-                    if os.path.exists(conf_path):
-                        with open(conf_path, "r") as f:
-                            config = json.load(f) if conf_name.endswith(".json") else yaml.safe_load(f)
-                        break
-                
-                # Only check for "hyper_parameters" if the checkpoint is actually a dictionary
-                if config is None and isinstance(checkpoint, dict) and "hyper_parameters" in checkpoint:
-                    config = checkpoint["hyper_parameters"]
-                
-                if config is None:
-                    # Final fallback: see if it's hiding somewhere else in the eval cfg
-                    if hasattr(cfg, "wm"):
-                        config = OmegaConf.to_container(cfg.wm, resolve=True)
-                    elif hasattr(cfg, "model"):
-                        config = OmegaConf.to_container(cfg.model, resolve=True)
-                    else:
-                        raise ValueError(f"Could not find model configuration in {base_dir} or inside the checkpoint.")
-
-                # Save the found config out to the parent scope
-                loaded_model_config = config
-
-                # 2. Extract and format the raw state_dict for stable_worldmodel
-                tmp_pt = os.path.join(base_dir, "tmp_converted_model.pt")
-                
-                # Handle whether the checkpoint is a full model object or a dictionary
-                if isinstance(checkpoint, torch.nn.Module):
-                    state_dict = checkpoint.state_dict()
-                else:
-                    state_dict = checkpoint.get("state_dict", checkpoint)
-                    
-                clean_state_dict = {
-                    k.replace("model.", "") if k.startswith("model.") else k: v 
-                    for k, v in state_dict.items()
-                }
-                torch.save(clean_state_dict, tmp_pt)
-                
-                return tmp_pt, config
-                
-            return original_resolve(name, cache_dir)
-            
-        # Apply patch
-        swm.wm.utils._resolve = local_resolve
-
-        # Load model using the extracted raw weights and config
-        model = swm.wm.utils.load_pretrained(cfg.policy)
+        # 1. Bypass load_pretrained completely. Your checkpoint is a full 
+        # PyTorch object, so we just load it directly.
+        model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         model = model.to("cuda")
         model = model.eval()
         model.requires_grad_(False)
@@ -429,17 +368,21 @@ def run(cfg: DictConfig):
         config = swm.PlanConfig(**cfg.plan_config)
         grad_cfg = cfg.get("gradient_solver", {})
         
-        # 3. Safely determine parameters for the solver that used to rely on cfg.wm
-        # Deduce action_dim from the StandardScaler if available
+        # 2. Safely deduce the parameters that were missing from cfg.wm
         if "action" in process:
             action_dim = process["action"].mean_.shape[0]
         else:
-            action_dim = loaded_model_config.get("action_dim", getattr(model, "action_dim", 2))
+            action_dim = getattr(model, "action_dim", 2)
             
-        # Extract history_size from the loaded config, defaulting to 1
-        wm_block = loaded_model_config.get("wm", loaded_model_config)
-        ctx_len = wm_block.get("history_size", getattr(model, "history_size", 1))
+        # Determine history size (check eval config, model attributes, or default to 1)
+        if hasattr(cfg, "wm") and hasattr(cfg.wm, "history_size"):
+            ctx_len = cfg.wm.history_size
+        elif hasattr(cfg, "model") and hasattr(cfg.model, "history_size"):
+            ctx_len = cfg.model.history_size
+        else:
+            ctx_len = getattr(model, "history_size", 1)
 
+        # 3. Initialize the solver
         solver = GradientBasedSolver(
             model=model,
             action_dim=action_dim,
