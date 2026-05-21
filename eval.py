@@ -297,12 +297,12 @@ class GradientWorldModelPolicy:
                     # If it's a single image (H, W, C), transform and add batch & time dims -> (1, 1, C, H, W)
                     batch[key] = self.transform[key](val_np).unsqueeze(0).unsqueeze(0)
                     
-                elif key in self.process:
-                    arr = np.array(val, dtype=np.float32).reshape(1, -1)
-                    transformed = self.process[key].transform(arr)
-                    t = torch.tensor(transformed, dtype=torch.float32)
-                    # action encoder expects (batch, seq_len, dim); add seq dim
-                    batch[key] = t.unsqueeze(1)   # (1, 1, action_dim)                )
+            elif key in self.process:
+                arr = np.array(val, dtype=np.float32).reshape(1, -1)
+                transformed = self.process[key].transform(arr)
+                t = torch.tensor(transformed, dtype=torch.float32)
+                # action encoder expects (batch, seq_len, dim); add seq dim
+                batch[key] = t.unsqueeze(1)   # (1, 1, action_dim)
             else:
                 try:
                     # Safely try to convert to float32 tensor
