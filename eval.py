@@ -133,10 +133,12 @@ class GradientBasedSolver:
         windows = torch.stack(
             [padded[:, t:t+chunk].reshape(B, chunk*D) for t in range(H)], dim=1
         )  # (1, horizon, 10)
+        
+        # We need gradients to flow through the action_encoder
         act_emb_seq = self.model.action_encoder(windows)
 
+        # Detach the initial context so we don't backprop into the visual encoder
         current_ctx_emb = ctx_emb.detach()   # (1, ctx_len, hidden_dim)
-        # Sliding action-embedding window starts with the observed context.
         current_ctx_act = ctx_act.detach()   # (1, ctx_len, embed_dim)
 
         total_energy = torch.zeros(1, device=ctx_emb.device, dtype=ctx_emb.dtype)
@@ -160,14 +162,17 @@ class GradientBasedSolver:
                 pred_emb = pred_out          # (1, hidden_dim)
 
             # ── energy: sum over hidden dim, mean over batch ────────────────
-            # Matches: energy = (pred - tgt).pow(2).sum(dim=-1).mean()
+            # Accumulate energy across the entire rollout (dense reward mapping).
             total_energy = total_energy + (
                 (pred_emb - goal_emb).pow(2).sum(dim=-1).mean()
             )
 
             # ── slide the observation context window ────────────────────────
+            # CRITICAL FIX: DO NOT detach pred_emb here! 
+            # Detaching here breaks Backpropagation Through Time (BPTT). We need 
+            # the gradients from future steps to flow backwards through past predictions.
             current_ctx_emb = torch.cat(
-                [current_ctx_emb[:, 1:], pred_emb.unsqueeze(1).detach()], dim=1
+                [current_ctx_emb[:, 1:], pred_emb.unsqueeze(1)], dim=1
             )
             current_ctx_act = full_act_ctx
 
