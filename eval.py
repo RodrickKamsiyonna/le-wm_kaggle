@@ -121,32 +121,19 @@ class GradientBasedSolver:
         ctx_act = output["act_emb"][:, : self.ctx_len]  # (1, ctx_len, embed_dim)
         return ctx_emb, ctx_act
 
-    def _compute_energy(
-        self,
-        ctx_emb: torch.Tensor,   # (1, ctx_len, hidden_dim)  — no grad needed
-        ctx_act: torch.Tensor,   # (1, ctx_len, embed_dim)   — no grad needed
-        act_seq: torch.Tensor,   # (1, horizon, action_dim)  — requires_grad=True
-        goal_emb: torch.Tensor,  # (1, hidden_dim)
-    ) -> torch.Tensor:
-        """
-        Roll out the predictor for `horizon` steps and return the total energy.
-
-        Energy definition matches lejepa_forward exactly:
-            E = sum_t  (pred_emb_t - goal_emb).pow(2).sum(dim=-1).mean()
-                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                       sum over hidden_dim, then mean over batch
-
-        ARPredictor expects the full context window of action embeddings, so
-        we maintain a sliding window that starts with the observed ctx_act and
-        is extended with the candidate actions as the rollout proceeds.
-
-        The gradient flows through action_encoder(act_seq) → predict → energy,
-        consistent with how grad_energy w.r.t. actions is computed in training.
-        """
-        # Encode the full candidate sequence through the action encoder so
-        # autograd can trace gradients back to act_seq.
-        # act_seq: (1, horizon, action_dim) → act_emb_seq: (1, horizon, embed_dim)
-        act_emb_seq = self.model.action_encoder(act_seq)
+    def _compute_energy(self, ctx_emb, ctx_act, act_seq, goal_emb):
+        # act_seq: (1, horizon, 2) → need (1, horizon, 10) for action_encoder
+        # Build sliding windows of 5 actions, tiling at the boundaries
+        B, H, D = act_seq.shape
+        chunk = 5
+        # Pad with the first action repeated at the front
+        pad = act_seq[:, :1].expand(B, chunk - 1, D)   # (1, 4, 2)
+        padded = torch.cat([pad, act_seq], dim=1)        # (1, horizon+4, 2)
+        # Build (1, horizon, 10) by taking windows of 5
+        windows = torch.stack(
+            [padded[:, t:t+chunk].reshape(B, chunk*D) for t in range(H)], dim=1
+        )  # (1, horizon, 10)
+        act_emb_seq = self.model.action_encoder(windows)
 
         current_ctx_emb = ctx_emb.detach()   # (1, ctx_len, hidden_dim)
         # Sliding action-embedding window starts with the observed context.
@@ -299,18 +286,17 @@ class GradientWorldModelPolicy:
                     
             elif key in self.process:
                 arr = np.array(val, dtype=np.float32).reshape(1, -1)
-                transformed = self.process[key].transform(arr)
-                t = torch.tensor(transformed, dtype=torch.float32)  # (1, 2)
-                
+                transformed = self.process[key].transform(arr)  # (1, 2)
+                t = torch.tensor(transformed, dtype=torch.float32)
+            
                 if key == "action":
                     # Model action_encoder expects (batch, seq_len, 10):
-                    # action_dim in training = 10 (5 action steps × 2 dims, flattened).
-                    # Repeat/tile the single 2-dim action to fill the 10-dim slot,
-                    # then unsqueeze the sequence dimension.
-                    # Actually: the scaler was fit on 10-dim actions, so reshape correctly:
-                    batch[key] = t.view(1, 1, -1)  # (1, 1, action_dim_as_stored)
+                    # 10 = 5 consecutive 2-dim actions flattened.
+                    # At encode time we only have 1 action, so tile it 5x to fill the window.
+                    tiled = t.repeat(1, 5)          # (1, 10)
+                    batch[key] = tiled.unsqueeze(1) # (1, 1, 10)
                 else:
-                    batch[key] = t.unsqueeze(1)
+                    batch[key] = t.unsqueeze(1)     # (1, 1, dim)
             else:
                 try:
                     # Safely try to convert to float32 tensor
@@ -432,10 +418,7 @@ def run(cfg: DictConfig):
         process[col] = processor
         if col != "action":
             process[f"goal_{col}"] = process[col]
-
-    print("action col shape:", stats_dataset.get_col_data("action").shape)
-    print("action scaler mean shape:", process["action"].mean_.shape)
-
+            
     policy_name = cfg.get("policy", "random")
     if policy_name != "random":
         ckpt_path = cfg.policy + "_object.ckpt"
@@ -453,11 +436,10 @@ def run(cfg: DictConfig):
         grad_cfg = cfg.get("gradient_solver", {})
         
         # 2. Safely deduce the parameters that were missing from cfg.wm
-        if "action" in process:
-            action_dim = process["action"].mean_.shape[0]
-        else:
-            action_dim = getattr(model, "action_dim", 2)
-            
+        raw_action_dim = process["action"].mean_.shape[0]  # 2
+        action_chunk = 5  # Conv1d has 10 input channels / 2 = 5
+        action_dim = raw_action_dim  # solver still optimizes 2-dim actions per step
+
         # Determine history size (check eval config, model attributes, or default to 1)
         if hasattr(cfg, "wm") and hasattr(cfg.wm, "history_size"):
             ctx_len = cfg.wm.history_size
