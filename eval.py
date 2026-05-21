@@ -288,11 +288,16 @@ class GradientWorldModelPolicy:
                     self.process[key].transform(arr), dtype=torch.float32
                 )
             else:
-                batch[key] = torch.tensor(
-                    np.array(val), dtype=torch.float32
-                ).unsqueeze(0)
+                try:
+                    # Safely try to convert to float32 tensor
+                    batch[key] = torch.tensor(
+                        np.array(val, dtype=np.float32), dtype=torch.float32
+                    ).unsqueeze(0)
+                except (TypeError, ValueError):
+                    # Skip metadata strings like 'env_name' or 'id'
+                    continue
         return batch
-
+    
     @torch.no_grad()
     def _encode_goal(self, goal_obs: dict) -> torch.Tensor:
         """Encode goal observation → (1, hidden_dim)."""
