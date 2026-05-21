@@ -369,7 +369,6 @@ def run(cfg: DictConfig):
             nonlocal loaded_model_config
             if os.path.exists(ckpt_path):
                 base_dir = os.path.dirname(ckpt_path)
-                
                 print(f"Loading checkpoint from {ckpt_path}...")
                 checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
                 
@@ -382,7 +381,8 @@ def run(cfg: DictConfig):
                             config = json.load(f) if conf_name.endswith(".json") else yaml.safe_load(f)
                         break
                 
-                if config is None and "hyper_parameters" in checkpoint:
+                # Only check for "hyper_parameters" if the checkpoint is actually a dictionary
+                if config is None and isinstance(checkpoint, dict) and "hyper_parameters" in checkpoint:
                     config = checkpoint["hyper_parameters"]
                 
                 if config is None:
@@ -399,7 +399,13 @@ def run(cfg: DictConfig):
 
                 # 2. Extract and format the raw state_dict for stable_worldmodel
                 tmp_pt = os.path.join(base_dir, "tmp_converted_model.pt")
-                state_dict = checkpoint.get("state_dict", checkpoint)
+                
+                # Handle whether the checkpoint is a full model object or a dictionary
+                if isinstance(checkpoint, torch.nn.Module):
+                    state_dict = checkpoint.state_dict()
+                else:
+                    state_dict = checkpoint.get("state_dict", checkpoint)
+                    
                 clean_state_dict = {
                     k.replace("model.", "") if k.startswith("model.") else k: v 
                     for k, v in state_dict.items()
