@@ -281,7 +281,22 @@ class GradientWorldModelPolicy:
         batch = {}
         for key, val in obs.items():
             if key in self.transform:
-                batch[key] = self.transform[key](val).unsqueeze(0)
+                # Convert to numpy array safely just in case the env returned a tensor
+                if torch.is_tensor(val):
+                    val_np = val.detach().cpu().numpy()
+                else:
+                    val_np = np.array(val)
+                
+                # Check if the environment gave us a sequence of frames: (T, H, W, C)
+                if val_np.ndim == 4:
+                    # Apply the transform to each frame individually
+                    frames = [self.transform[key](val_np[t]) for t in range(val_np.shape[0])]
+                    # Stack into (T, C, H, W) and add the batch dimension -> (1, T, C, H, W)
+                    batch[key] = torch.stack(frames, dim=0).unsqueeze(0)
+                else:
+                    # If it's a single image (H, W, C), transform and add batch & time dims -> (1, 1, C, H, W)
+                    batch[key] = self.transform[key](val_np).unsqueeze(0).unsqueeze(0)
+                    
             elif key in self.process:
                 arr = np.array(val, dtype=np.float32).reshape(1, -1)
                 batch[key] = torch.tensor(
@@ -294,7 +309,7 @@ class GradientWorldModelPolicy:
                         np.array(val, dtype=np.float32), dtype=torch.float32
                     ).unsqueeze(0)
                 except (TypeError, ValueError):
-                    # Skip metadata strings like 'env_name' or 'id'
+                    # Skip metadata strings like 'env_name'
                     continue
         return batch
     
