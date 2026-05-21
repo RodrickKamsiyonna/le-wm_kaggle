@@ -353,30 +353,57 @@ def run(cfg: DictConfig):
             process[f"goal_{col}"] = process[col]
 
     policy_name = cfg.get("policy", "random")
-
     if policy_name != "random":
         import os
         import json
+        import torch
+        from omegaconf import OmegaConf
+
+        # 1. Target the exact .ckpt file based on your config
+        ckpt_path = cfg.policy + "_object.ckpt"
         
-        # Intercept the library's internal HuggingFace resolver to allow local paths
         original_resolve = swm.wm.utils._resolve
         
         def local_resolve(name, cache_dir):
-            if os.path.exists(name):
-                # If it's a local path, load the config.json directly and skip HuggingFace
-                config_path = os.path.join(name, "config.json")
-                with open(config_path, "r") as f:
-                    config = json.load(f)
-                return name, config
+            if os.path.exists(ckpt_path):
+                base_dir = os.path.dirname(ckpt_path)
+                
+                # 2. Try to find the model config, or fallback to Hydra's loaded cfg.wm
+                config_path = os.path.join(base_dir, "config.json")
+                if os.path.exists(config_path):
+                    with open(config_path, "r") as f:
+                        config = json.load(f)
+                else:
+                    # If config.json isn't saved, use the config loaded in memory
+                    config = OmegaConf.to_container(cfg.wm, resolve=True)
+                
+                # 3. Convert the .ckpt (which often has extra metadata/prefixes) into a raw .pt state dict
+                tmp_pt = os.path.join(base_dir, "tmp_converted_model.pt")
+                if not os.path.exists(tmp_pt):
+                    print(f"Converting {ckpt_path} to raw .pt format for loader...")
+                    checkpoint = torch.load(ckpt_path, map_location="cpu")
+                    
+                    # Extract raw state_dict if it's a Lightning or wrapped checkpoint
+                    state_dict = checkpoint.get("state_dict", checkpoint)
+                    
+                    # Clean up 'model.' prefix if the trainer added it
+                    clean_state_dict = {
+                        k.replace("model.", "") if k.startswith("model.") else k: v 
+                        for k, v in state_dict.items()
+                    }
+                    torch.save(clean_state_dict, tmp_pt)
+                
+                # Return the converted .pt file and config dict, bypassing HuggingFace
+                return tmp_pt, config
+                
             return original_resolve(name, cache_dir)
             
         # Apply the patch temporarily
         swm.wm.utils._resolve = local_resolve
 
-        # Now load_pretrained will successfully read from your /kaggle/working/ directory
+        # Load the model using the patched resolver
         model = swm.wm.utils.load_pretrained(cfg.policy)
         model = model.to("cuda")
-    
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
