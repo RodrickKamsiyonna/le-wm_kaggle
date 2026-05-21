@@ -421,7 +421,6 @@ def run(cfg: DictConfig):
     stats_dataset = dataset
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
     ep_indices, _ = np.unique(stats_dataset.get_col_data(col_name), return_index=True)
-
     process = {}
     for col in cfg.dataset.keys_to_cache:
         if col in ["pixels"]:
@@ -433,6 +432,9 @@ def run(cfg: DictConfig):
         process[col] = processor
         if col != "action":
             process[f"goal_{col}"] = process[col]
+
+    print("action col shape:", stats_dataset.get_col_data("action").shape)
+    print("action scaler mean shape:", process["action"].mean_.shape)
 
     policy_name = cfg.get("policy", "random")
     if policy_name != "random":
