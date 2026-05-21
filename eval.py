@@ -355,11 +355,28 @@ def run(cfg: DictConfig):
     policy_name = cfg.get("policy", "random")
 
     if policy_name != "random":
-        # FIX 3: use load_pretrained (same as the CEM eval) so the returned
-        # object is the JEPA model with the .encode / .predict / .action_encoder
-        # interface that GradientBasedSolver depends on.
+        import os
+        import json
+        
+        # Intercept the library's internal HuggingFace resolver to allow local paths
+        original_resolve = swm.wm.utils._resolve
+        
+        def local_resolve(name, cache_dir):
+            if os.path.exists(name):
+                # If it's a local path, load the config.json directly and skip HuggingFace
+                config_path = os.path.join(name, "config.json")
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                return name, config
+            return original_resolve(name, cache_dir)
+            
+        # Apply the patch temporarily
+        swm.wm.utils._resolve = local_resolve
+
+        # Now load_pretrained will successfully read from your /kaggle/working/ directory
         model = swm.wm.utils.load_pretrained(cfg.policy)
         model = model.to("cuda")
+    
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
@@ -367,6 +384,7 @@ def run(cfg: DictConfig):
         config = swm.PlanConfig(**cfg.plan_config)
 
         grad_cfg = cfg.get("gradient_solver", {})
+        
         solver = GradientBasedSolver(
             model=model,
             action_dim=cfg.wm.action_dim,
