@@ -371,7 +371,7 @@ def run(cfg: DictConfig):
                 base_dir = os.path.dirname(ckpt_path)
                 
                 print(f"Loading checkpoint from {ckpt_path}...")
-                checkpoint = torch.load(ckpt_path, map_location="cpu")
+                checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
                 
                 # 1. Search for the model config (checks adjacent files or internal checkpoint data)
                 config = None
