@@ -263,6 +263,16 @@ class GradientWorldModelPolicy:
         self.config = config
         self.process = process
         self.transform = transform
+        self.env = None
+
+    def set_env(self, env):
+        """Satisfy the stable_worldmodel policy interface."""
+        self.env = env
+
+    def reset(self):
+        """Satisfy the stable_worldmodel policy interface. 
+        Clear any internal state if needed at the start of an episode."""
+        pass
 
     def _preprocess_obs(self, obs: dict) -> dict:
         batch = {}
