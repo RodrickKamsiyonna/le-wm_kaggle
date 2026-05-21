@@ -456,7 +456,7 @@ def run(cfg: DictConfig):
             config=config,
             process=process,
             transform=transform,
-        )        )
+        )
     else:
         policy = swm.policy.RandomPolicy()
 
