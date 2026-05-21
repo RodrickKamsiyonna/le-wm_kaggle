@@ -263,16 +263,19 @@ class GradientWorldModelPolicy:
         self.config = config
         self.process = process
         self.transform = transform
+        
         self.env = None
+        self.action_buffer = None
+        self.steps_in_buffer = 0
 
     def set_env(self, env):
-        """Satisfy the stable_worldmodel policy interface."""
+        """Satisfy the stable_worldmodel policy interface by linking the environment."""
         self.env = env
 
     def reset(self):
-        """Satisfy the stable_worldmodel policy interface. 
-        Clear any internal state if needed at the start of an episode."""
-        pass
+        """Clear the action buffer when the environment resets."""
+        self.action_buffer = None
+        self.steps_in_buffer = 0
 
     def _preprocess_obs(self, obs: dict) -> dict:
         batch = {}
@@ -297,9 +300,6 @@ class GradientWorldModelPolicy:
         device = next(self.solver.model.parameters()).device
         batch = {k: v.to(device) for k, v in batch.items()}
         output = self.solver.model.encode(batch)
-        # Take the last frame of the encoded sequence as the goal latent and
-        # squeeze to (1, hidden_dim) — consistent with how goal_emb is used in
-        # _compute_energy.
         return output["emb"][:, -1]   # (1, hidden_dim)
 
     def act(self, obs: dict, goal_obs: dict) -> np.ndarray:
@@ -321,6 +321,49 @@ class GradientWorldModelPolicy:
 
         return actions_np
 
+    def get_action(self, infos: dict) -> np.ndarray:
+        """
+        Main entry point called by stable_worldmodel.World during evaluation.
+        Handles batched environments and receding horizon action caching.
+        """
+        # Determine the number of parallel environments (batch size)
+        num_envs = len(infos.get("pixels", infos.get("observation", [0])))
+
+        # Replan only if buffer is empty or action block is exhausted
+        if self.action_buffer is None or self.steps_in_buffer >= self.config.action_block:
+            
+            # Split 'infos' into current obs and goal obs
+            obs_batch = {}
+            goal_batch = {}
+            for k, v in infos.items():
+                if k == "goal":
+                    goal_batch["pixels"] = v
+                elif k.startswith("goal_"):
+                    goal_batch[k.replace("goal_", "")] = v
+                else:
+                    obs_batch[k] = v
+
+            planned_actions = []
+            
+            # Since GradientBasedSolver is hardcoded for batch_size=1, 
+            # we loop over all environments to plan for them independently.
+            for i in range(num_envs):
+                single_obs = {k: v[i] for k, v in obs_batch.items() if v is not None}
+                single_goal = {k: v[i] for k, v in goal_batch.items() if v is not None}
+                
+                # Returns (action_block, action_dim)
+                acts = self.act(single_obs, single_goal)
+                planned_actions.append(acts)
+            
+            # Stack into (num_envs, action_block, action_dim)
+            self.action_buffer = np.stack(planned_actions, axis=0)
+            self.steps_in_buffer = 0
+            
+        # Pop the next action for all environments: shape (num_envs, action_dim)
+        actions = self.action_buffer[:, self.steps_in_buffer, :]
+        self.steps_in_buffer += 1
+        
+        return actions
 
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
