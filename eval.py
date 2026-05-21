@@ -356,52 +356,64 @@ def run(cfg: DictConfig):
     if policy_name != "random":
         import os
         import json
+        import yaml
         import torch
         from omegaconf import OmegaConf
 
-        # 1. Target the exact .ckpt file based on your config
         ckpt_path = cfg.policy + "_object.ckpt"
+        loaded_model_config = {}
         
         original_resolve = swm.wm.utils._resolve
         
         def local_resolve(name, cache_dir):
+            nonlocal loaded_model_config
             if os.path.exists(ckpt_path):
                 base_dir = os.path.dirname(ckpt_path)
                 
-                # 2. Try to find the model config, or fallback to Hydra's loaded cfg.wm
-                config_path = os.path.join(base_dir, "config.json")
-                if os.path.exists(config_path):
-                    with open(config_path, "r") as f:
-                        config = json.load(f)
-                else:
-                    # If config.json isn't saved, use the config loaded in memory
-                    config = OmegaConf.to_container(cfg.wm, resolve=True)
+                print(f"Loading checkpoint from {ckpt_path}...")
+                checkpoint = torch.load(ckpt_path, map_location="cpu")
                 
-                # 3. Convert the .ckpt (which often has extra metadata/prefixes) into a raw .pt state dict
+                # 1. Search for the model config (checks adjacent files or internal checkpoint data)
+                config = None
+                for conf_name in ["config.json", "config.yaml", "hparams.yaml"]:
+                    conf_path = os.path.join(base_dir, conf_name)
+                    if os.path.exists(conf_path):
+                        with open(conf_path, "r") as f:
+                            config = json.load(f) if conf_name.endswith(".json") else yaml.safe_load(f)
+                        break
+                
+                if config is None and "hyper_parameters" in checkpoint:
+                    config = checkpoint["hyper_parameters"]
+                
+                if config is None:
+                    # Final fallback: see if it's hiding somewhere else in the eval cfg
+                    if hasattr(cfg, "wm"):
+                        config = OmegaConf.to_container(cfg.wm, resolve=True)
+                    elif hasattr(cfg, "model"):
+                        config = OmegaConf.to_container(cfg.model, resolve=True)
+                    else:
+                        raise ValueError(f"Could not find model configuration in {base_dir} or inside the checkpoint.")
+
+                # Save the found config out to the parent scope
+                loaded_model_config = config
+
+                # 2. Extract and format the raw state_dict for stable_worldmodel
                 tmp_pt = os.path.join(base_dir, "tmp_converted_model.pt")
-                if not os.path.exists(tmp_pt):
-                    print(f"Converting {ckpt_path} to raw .pt format for loader...")
-                    checkpoint = torch.load(ckpt_path, map_location="cpu")
-                    
-                    # Extract raw state_dict if it's a Lightning or wrapped checkpoint
-                    state_dict = checkpoint.get("state_dict", checkpoint)
-                    
-                    # Clean up 'model.' prefix if the trainer added it
-                    clean_state_dict = {
-                        k.replace("model.", "") if k.startswith("model.") else k: v 
-                        for k, v in state_dict.items()
-                    }
-                    torch.save(clean_state_dict, tmp_pt)
+                state_dict = checkpoint.get("state_dict", checkpoint)
+                clean_state_dict = {
+                    k.replace("model.", "") if k.startswith("model.") else k: v 
+                    for k, v in state_dict.items()
+                }
+                torch.save(clean_state_dict, tmp_pt)
                 
-                # Return the converted .pt file and config dict, bypassing HuggingFace
                 return tmp_pt, config
                 
             return original_resolve(name, cache_dir)
             
-        # Apply the patch temporarily
+        # Apply patch
         swm.wm.utils._resolve = local_resolve
 
-        # Load the model using the patched resolver
+        # Load model using the extracted raw weights and config
         model = swm.wm.utils.load_pretrained(cfg.policy)
         model = model.to("cuda")
         model = model.eval()
@@ -409,17 +421,25 @@ def run(cfg: DictConfig):
         model.interpolate_pos_encoding = True
 
         config = swm.PlanConfig(**cfg.plan_config)
-
         grad_cfg = cfg.get("gradient_solver", {})
         
+        # 3. Safely determine parameters for the solver that used to rely on cfg.wm
+        # Deduce action_dim from the StandardScaler if available
+        if "action" in process:
+            action_dim = process["action"].mean_.shape[0]
+        else:
+            action_dim = loaded_model_config.get("action_dim", getattr(model, "action_dim", 2))
+            
+        # Extract history_size from the loaded config, defaulting to 1
+        wm_block = loaded_model_config.get("wm", loaded_model_config)
+        ctx_len = wm_block.get("history_size", getattr(model, "history_size", 1))
+
         solver = GradientBasedSolver(
             model=model,
-            action_dim=cfg.wm.action_dim,
+            action_dim=action_dim,
             horizon=cfg.plan_config.horizon,
             action_block=cfg.plan_config.action_block,
-            # FIX 4: pass ctx_len so the solver can maintain the correct
-            # sliding action-embedding window width for ARPredictor.
-            ctx_len=cfg.wm.history_size,
+            ctx_len=ctx_len,
             n_iter=grad_cfg.get("n_iter", 50),
             lr=grad_cfg.get("lr", 0.05),
             n_restarts=grad_cfg.get("n_restarts", 4),
@@ -430,13 +450,13 @@ def run(cfg: DictConfig):
                 else None
             ),
         )
-
+        
         policy = GradientWorldModelPolicy(
             solver=solver,
             config=config,
             process=process,
             transform=transform,
-        )
+        )        )
     else:
         policy = swm.policy.RandomPolicy()
 
