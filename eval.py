@@ -52,14 +52,17 @@ class GradientBasedSolver:
     """
     Gradient-based action sequence optimizer.
 
-    Treats the action sequence as a continuous variable and minimizes the
-    world-model energy via gradient descent, consistent with the EQM training
-    objective in lejepa_forward.
+    Optimizes over macro-actions (chunks) directly, matching the exact
+    temporal stride and input dimensionality seen by the action_encoder
+    during training.  Each optimized variable is a (action_chunk * action_dim)
+    vector — identical in shape and semantics to one training sample row.
 
-    The sequence optimizes over macro-actions (chunks) directly to perfectly
-    match the temporal stride and dimensionality seen during training.
-    
-    The energy is computed only at the terminal step to avoid penalizing 
+    To extract executable single-step actions we take only the LAST
+    (most-recent) action_dim slice of the first chunk.  This is consistent
+    with how the dataset is constructed: position [-action_dim:] of a chunk
+    is the action that was actually executed at the corresponding time step.
+
+    The energy is computed only at the terminal step to avoid penalising
     exploratory intermediate latent states:
         E = (final_pred_emb - goal_emb).pow(2).sum(dim=-1)
 
@@ -67,19 +70,19 @@ class GradientBasedSolver:
         model:          JEPA world model loaded via swm.wm.utils.load_pretrained.
         action_dim:     Dimensionality of a single raw action vector (e.g. 2).
         horizon:        Number of latent rollout steps to optimise over.
-        action_block:   How many RAW action steps to execute before re-planning.
+        action_block:   How many raw single-step actions to execute before
+                        re-planning (must be <= horizon).
         ctx_len:        History window length used during training
-                        (cfg.wm.history_size). Needed to build the sliding
-                        context correctly.
+                        (cfg.wm.history_size).
         action_chunk:   Number of consecutive actions flattened into one
-                        action-encoder input (matches training frameskip).
+                        action-encoder input (== training frameskip).
         n_iter:         Gradient-descent iterations per planning call.
         lr:             Adam learning rate.
         grad_clip:      Max norm for gradient clipping on act_seq.
         n_restarts:     Independent random restarts; best solution is kept.
         action_noise:   Std of Gaussian noise injected after every grad step.
-        action_bounds:  Optional (low, high) tuple; actions are clamped after
-                        every update.
+        action_bounds:  Optional (low, high) tuple in *normalised* space;
+                        chunks are clamped element-wise after every update.
     """
 
     def __init__(
@@ -97,12 +100,16 @@ class GradientBasedSolver:
         action_noise: float = 0.0,
         action_bounds: tuple | None = None,
     ):
+        assert action_block <= horizon, (
+            f"action_block ({action_block}) must be <= horizon ({horizon})"
+        )
         self.model = model
         self.action_dim = action_dim
         self.horizon = horizon
         self.action_block = action_block
         self.ctx_len = ctx_len
         self.action_chunk = action_chunk
+        self.chunk_dim = action_chunk * action_dim  # full encoder input width
         self.n_iter = n_iter
         self.lr = lr
         self.grad_clip = grad_clip
@@ -112,11 +119,11 @@ class GradientBasedSolver:
 
     @torch.no_grad()
     def _encode_context(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode the current observation context."""
+        """Encode the current observation context into (ctx_emb, ctx_act)."""
         output = self.model.encode(batch)
 
-        raw_emb = output["emb"]       # (1, T_obs, hidden_dim)
-        raw_act = output["act_emb"]   # (1, T_obs, embed_dim)
+        raw_emb = output["emb"]     # (1, T_obs, hidden_dim)
+        raw_act = output["act_emb"] # (1, T_obs, embed_dim)
 
         T_obs = raw_emb.shape[1]
 
@@ -141,68 +148,86 @@ class GradientBasedSolver:
         act_seq: torch.Tensor,
         goal_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """Roll out the world model and compute sparse terminal energy toward the goal."""
-        
-        # act_seq is already (1, horizon, action_chunk * action_dim) 
-        # so it maps directly into the action_encoder without artificial padding.
-        act_emb_seq = self.model.action_encoder(act_seq)
+        """
+        Roll out the world model for `horizon` steps and return the terminal
+        squared-distance energy to goal_emb.
+
+        act_seq: (1, horizon, chunk_dim)  — optimised macro-action sequence,
+                 already in the same space as training rows (normalised,
+                 chunk_dim = action_chunk * action_dim).
+        """
+        # Encode all horizon macro-actions in one batched call.
+        # act_seq shape: (1, horizon, chunk_dim)
+        act_emb_seq = self.model.action_encoder(act_seq)  # (1, horizon, embed_dim)
 
         current_ctx_emb = ctx_emb.detach()
         current_ctx_act = ctx_act.detach()
-        
+
         final_pred_emb = None
 
         for t in range(self.horizon):
-            step_act_emb = act_emb_seq[:, t : t + 1]
+            step_act_emb = act_emb_seq[:, t : t + 1]           # (1, 1, embed_dim)
             full_act_ctx = torch.cat(
-                [current_ctx_act[:, 1:], step_act_emb], dim=1
+                [current_ctx_act[:, 1:], step_act_emb], dim=1  # slide window
             )
 
             pred_out = self.model.predict(current_ctx_emb, full_act_ctx)
-            if pred_out.dim() == 3:
-                pred_emb = pred_out[:, -1]
-            else:
-                pred_emb = pred_out
+            pred_emb = pred_out[:, -1] if pred_out.dim() == 3 else pred_out
 
             current_ctx_emb = torch.cat(
                 [current_ctx_emb[:, 1:], pred_emb.unsqueeze(1)], dim=1
             )
             current_ctx_act = full_act_ctx
-            
+
             final_pred_emb = pred_emb
 
         assert final_pred_emb is not None, "horizon must be >= 1"
 
-        # ── energy: terminal cost evaluated only on the final step ─────────────
-        total_energy = (final_pred_emb - goal_emb).pow(2).sum(dim=-1)
-        
-        return total_energy
+        return (final_pred_emb - goal_emb).pow(2).sum(dim=-1)  # scalar per batch
 
     def solve(
         self,
         batch: dict,
         goal_emb: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return the best raw action block found across `n_restarts` initializations."""
+    ) -> np.ndarray:
+        """
+        Return `action_block` normalised single-step actions as a numpy array
+        of shape (action_block, action_dim).
+
+        How single-step actions are extracted from optimised chunks
+        ─────────────────────────────────────────────────────────────
+        During training each dataset row contains a chunk of `action_chunk`
+        consecutive normalised actions laid out as:
+
+            [a_{t-k+1}, ..., a_{t-1}, a_t]   (oldest → newest)
+
+        The action that was *executed* at step t is a_t, i.e. the last
+        action_dim values of the chunk vector.  We therefore extract executed
+        actions from the optimised chunks by taking the last action_dim values
+        of each chunk:
+
+            executed_action_i = act_seq[0, i, -action_dim:]
+
+        This gives `horizon` normalised single-step actions.  We return the
+        first `action_block` of them.
+        """
         device = goal_emb.device
         dtype = goal_emb.dtype
 
         goal_emb = goal_emb.view(1, -1)
-
         ctx_emb, ctx_act = self._encode_context(batch)
 
         best_energy = float("inf")
-        best_actions = None
+        best_act_seq = None
 
         for _ in range(self.n_restarts):
-            # Optimize directly over the chunked macro-actions: (1, horizon, chunk * dim)
+            # Initialise in the same space as training rows.
             act_seq = torch.randn(
-                1, self.horizon, self.action_chunk * self.action_dim, device=device, dtype=dtype
+                1, self.horizon, self.chunk_dim, device=device, dtype=dtype
             )
-            
             if self.action_bounds is not None:
                 lo, hi = self.action_bounds
-                act_seq.clamp_(lo, hi)
+                act_seq.data.clamp_(lo, hi)
             act_seq = act_seq.requires_grad_(True)
 
             optimizer = torch.optim.Adam([act_seq], lr=self.lr)
@@ -231,14 +256,19 @@ class GradientBasedSolver:
 
             if final_energy < best_energy:
                 best_energy = final_energy
-                best_actions = act_seq.detach().clone()
+                best_act_seq = act_seq.detach().clone()  # (1, horizon, chunk_dim)
 
-        # best_actions is (1, horizon, chunk * dim). 
-        # Unpack it to a flat array of single steps: (horizon * chunk, dim)
-        best_acts_flat = best_actions[0].reshape(self.horizon * self.action_chunk, self.action_dim)
-        
-        # Return the requested action block length
-        return best_acts_flat[: self.action_block]
+        # ── Extract single-step actions from the optimised chunks ────────────
+        # best_act_seq: (1, horizon, chunk_dim)
+        # The last action_dim values of each chunk are the "executed" action
+        # for that latent step, consistent with dataset construction.
+        #
+        # Result: (horizon, action_dim) normalised actions.
+        executed = best_act_seq[0, :, -self.action_dim:]  # (horizon, action_dim)
+
+        # Return the first action_block steps as a plain numpy array.
+        # inverse_transform is applied by the caller (GradientWorldModelPolicy.act).
+        return executed[: self.action_block].cpu().numpy()
 
 
 class GradientWorldModelPolicy:
@@ -268,12 +298,22 @@ class GradientWorldModelPolicy:
         self.steps_in_buffer = 0
 
     def _preprocess_obs(self, obs: dict) -> dict:
+        """
+        Convert a raw observation dict into a model-ready batch dict.
+
+        For the action key we tile the single normalised action into a full
+        chunk so the model's encode() receives the expected (chunk_dim,) input.
+        All other non-image keys are normalised with their StandardScaler and
+        left as single-timestep tensors.
+        """
         batch = {}
         chunk = self.solver.action_chunk
 
         for key, val in obs.items():
             if key in self.transform:
-                val_np = val.detach().cpu().numpy() if torch.is_tensor(val) else np.array(val)
+                val_np = (
+                    val.detach().cpu().numpy() if torch.is_tensor(val) else np.array(val)
+                )
                 if val_np.ndim == 4:
                     frames = [self.transform[key](val_np[t]) for t in range(val_np.shape[0])]
                     batch[key] = torch.stack(frames, dim=0).unsqueeze(0)
@@ -282,14 +322,18 @@ class GradientWorldModelPolicy:
 
             elif key in self.process:
                 arr = np.array(val, dtype=np.float32).reshape(1, -1)
-                transformed = self.process[key].transform(arr)
+                # StandardScaler operates on (N, action_dim) rows.
+                transformed = self.process[key].transform(arr)  # (1, action_dim)
                 t = torch.tensor(transformed, dtype=torch.float32)
 
                 if key == "action":
-                    tiled = t.repeat(1, chunk)
-                    batch[key] = tiled.unsqueeze(1)
+                    # Tile into a fake chunk: [a, a, ..., a] of length chunk.
+                    # This is only used for encoding the *context* observation,
+                    # not for the planned actions, so the approximation is fine.
+                    tiled = t.repeat(1, chunk)           # (1, chunk * action_dim)
+                    batch[key] = tiled.unsqueeze(1)      # (1, 1, chunk_dim)
                 else:
-                    batch[key] = t.unsqueeze(1)
+                    batch[key] = t.unsqueeze(1)          # (1, 1, feature_dim)
 
             else:
                 try:
@@ -303,28 +347,40 @@ class GradientWorldModelPolicy:
 
     @torch.no_grad()
     def _encode_goal(self, goal_obs: dict) -> torch.Tensor:
+        """Encode the goal observation and return its last embedding vector."""
         batch = self._preprocess_obs(goal_obs)
         device = next(self.solver.model.parameters()).device
         batch = {k: v.to(device) for k, v in batch.items()}
         output = self.solver.model.encode(batch)
-        return output["emb"][:, -1]
+        return output["emb"][:, -1]  # (1, hidden_dim)
 
     def act(self, obs: dict, goal_obs: dict) -> np.ndarray:
+        """
+        Plan and return `action_block` raw (un-normalised) actions as
+        (action_block, action_dim) numpy array.
+        """
         device = next(self.solver.model.parameters()).device
 
         batch = self._preprocess_obs(obs)
         batch = {k: v.to(device) for k, v in batch.items()}
         goal_emb = self._encode_goal(goal_obs)
 
-        actions = self.solver.solve(batch, goal_emb)
+        # solve() returns normalised actions: (action_block, action_dim) numpy
+        actions_norm = self.solver.solve(batch, goal_emb)
 
-        actions_np = actions.cpu().numpy()
+        # Invert normalisation to get raw environment actions.
         if "action" in self.process:
-            actions_np = self.process["action"].inverse_transform(actions_np)
+            actions_raw = self.process["action"].inverse_transform(actions_norm)
+        else:
+            actions_raw = actions_norm
 
-        return actions_np
+        return actions_raw  # (action_block, action_dim)
 
     def get_action(self, infos: dict) -> np.ndarray:
+        """
+        Called every env step.  Re-plans when the action buffer is exhausted.
+        Returns (num_envs, action_dim) raw actions.
+        """
         first_val = next(iter(infos.values()))
         num_envs = len(first_val) if hasattr(first_val, "__len__") else 1
 
@@ -340,21 +396,16 @@ class GradientWorldModelPolicy:
                     obs_batch[k] = v
 
             planned_actions = []
-
             for i in range(num_envs):
-                single_obs = {
-                    k: v[i] for k, v in obs_batch.items() if v is not None
-                }
-                single_goal = {
-                    k: v[i] for k, v in goal_batch.items() if v is not None
-                }
-                acts = self.act(single_obs, single_goal)
+                single_obs  = {k: v[i] for k, v in obs_batch.items()  if v is not None}
+                single_goal = {k: v[i] for k, v in goal_batch.items() if v is not None}
+                acts = self.act(single_obs, single_goal)  # (action_block, action_dim)
                 planned_actions.append(acts)
 
-            self.action_buffer = np.stack(planned_actions, axis=0)
+            self.action_buffer = np.stack(planned_actions, axis=0)  # (num_envs, action_block, action_dim)
             self.steps_in_buffer = 0
 
-        actions = self.action_buffer[:, self.steps_in_buffer, :]
+        actions = self.action_buffer[:, self.steps_in_buffer, :]  # (num_envs, action_dim)
         self.steps_in_buffer += 1
         return actions
 
@@ -376,7 +427,7 @@ def run(cfg: DictConfig):
 
     transform = {
         "pixels": img_transform(cfg),
-        "goal": img_transform(cfg),
+        "goal":   img_transform(cfg),
     }
 
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
@@ -384,6 +435,7 @@ def run(cfg: DictConfig):
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
     ep_indices, _ = np.unique(stats_dataset.get_col_data(col_name), return_index=True)
 
+    # ── Build per-column StandardScalers ─────────────────────────────────────
     process = {}
     for col in cfg.dataset.keys_to_cache:
         if col in ["pixels"]:
@@ -407,11 +459,13 @@ def run(cfg: DictConfig):
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
 
-        config = swm.PlanConfig(**cfg.plan_config)
+        config  = swm.PlanConfig(**cfg.plan_config)
         grad_cfg = cfg.get("gradient_solver", {})
 
+        # action_dim: dimensionality of a single raw action step
         raw_action_dim = process["action"].mean_.shape[0]
 
+        # action_chunk: how many consecutive steps the encoder expects
         if hasattr(cfg, "wm") and hasattr(cfg.wm, "action_chunk"):
             action_chunk = cfg.wm.action_chunk
         elif hasattr(model, "action_encoder") and hasattr(
@@ -421,6 +475,7 @@ def run(cfg: DictConfig):
         else:
             action_chunk = grad_cfg.get("action_chunk", 5)
 
+        # ctx_len: observation history window
         if hasattr(cfg, "wm") and hasattr(cfg.wm, "history_size"):
             ctx_len = cfg.wm.history_size
         elif hasattr(cfg, "model") and hasattr(cfg.model, "history_size"):
@@ -428,12 +483,20 @@ def run(cfg: DictConfig):
         else:
             ctx_len = getattr(model, "history_size", 1)
 
-        # Apply StandardScaler to the raw bounds from config
+        # ── Action bounds in normalised space ─────────────────────────────────
+        # The StandardScaler is fit on single-step (action_dim,) rows, so we
+        # transform a single-step bound vector and read off the scalar.
+        # We apply it element-wise to the full chunk tensor, which is correct
+        # as long as the scaler was fit on the same action space (it was).
         action_bounds = None
         if grad_cfg.get("action_bounds"):
             raw_lo, raw_hi = grad_cfg.action_bounds
-            norm_lo = process["action"].transform(np.array([[raw_lo] * raw_action_dim]))[0, 0]
-            norm_hi = process["action"].transform(np.array([[raw_hi] * raw_action_dim]))[0, 0]
+            norm_lo = process["action"].transform(
+                np.array([[raw_lo] * raw_action_dim], dtype=np.float32)
+            )[0, 0]
+            norm_hi = process["action"].transform(
+                np.array([[raw_hi] * raw_action_dim], dtype=np.float32)
+            )[0, 0]
             action_bounds = (norm_lo, norm_hi)
 
         solver = GradientBasedSolver(
@@ -475,7 +538,7 @@ def run(cfg: DictConfig):
         [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
     )
 
-    valid_mask = dataset.get_col_data("step_idx") <= max_start_per_row
+    valid_mask    = dataset.get_col_data("step_idx") <= max_start_per_row
     valid_indices = np.nonzero(valid_mask)[0]
     print(valid_mask.sum(), "valid starting points found for evaluation.")
 
@@ -485,7 +548,7 @@ def run(cfg: DictConfig):
     )
     random_episode_indices = np.sort(valid_indices[random_episode_indices])
 
-    eval_episodes = dataset.get_row_data(random_episode_indices)[col_name]
+    eval_episodes  = dataset.get_row_data(random_episode_indices)[col_name]
     eval_start_idx = dataset.get_row_data(random_episode_indices)["step_idx"]
 
     if len(eval_episodes) < cfg.eval.num_eval:
