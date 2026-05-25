@@ -56,6 +56,9 @@ class GradientBasedSolver:
     world-model energy via gradient descent, consistent with the EQM training
     objective in lejepa_forward.
 
+    The sequence optimizes over macro-actions (chunks) directly to perfectly
+    match the temporal stride and dimensionality seen during training.
+    
     The energy is computed only at the terminal step to avoid penalizing 
     exploratory intermediate latent states:
         E = (final_pred_emb - goal_emb).pow(2).sum(dim=-1)
@@ -63,9 +66,8 @@ class GradientBasedSolver:
     Args:
         model:          JEPA world model loaded via swm.wm.utils.load_pretrained.
         action_dim:     Dimensionality of a single raw action vector (e.g. 2).
-        horizon:        Number of rollout steps to optimise over.
-        action_block:   How many of those steps to actually execute before
-                        re-planning (receding-horizon control).
+        horizon:        Number of latent rollout steps to optimise over.
+        action_block:   How many RAW action steps to execute before re-planning.
         ctx_len:        History window length used during training
                         (cfg.wm.history_size). Needed to build the sliding
                         context correctly.
@@ -132,19 +134,6 @@ class GradientBasedSolver:
 
         return ctx_emb, ctx_act
 
-    def _build_action_windows(self, act_seq: torch.Tensor) -> torch.Tensor:
-        """Convert (B, H, action_dim) → (B, H, action_chunk * action_dim) using unfold."""
-        B, H, D = act_seq.shape
-        chunk = self.action_chunk
-
-        # Left-pad with the first action repeated (chunk-1) times.
-        pad = act_seq[:, :1].expand(B, chunk - 1, D)
-        padded = torch.cat([pad, act_seq], dim=1)
-
-        # Unfold cleanly creates the sliding windows natively in C++
-        windows = padded.unfold(dimension=1, size=chunk, step=1)
-        return windows.transpose(2, 3).reshape(B, H, chunk * D)
-
     def _compute_energy(
         self,
         ctx_emb: torch.Tensor,
@@ -153,8 +142,10 @@ class GradientBasedSolver:
         goal_emb: torch.Tensor,
     ) -> torch.Tensor:
         """Roll out the world model and compute sparse terminal energy toward the goal."""
-        act_windows = self._build_action_windows(act_seq)
-        act_emb_seq = self.model.action_encoder(act_windows)
+        
+        # act_seq is already (1, horizon, action_chunk * action_dim) 
+        # so it maps directly into the action_encoder without artificial padding.
+        act_emb_seq = self.model.action_encoder(act_seq)
 
         current_ctx_emb = ctx_emb.detach()
         current_ctx_act = ctx_act.detach()
@@ -182,6 +173,7 @@ class GradientBasedSolver:
 
         assert final_pred_emb is not None, "horizon must be >= 1"
 
+        # ── energy: terminal cost evaluated only on the final step ─────────────
         total_energy = (final_pred_emb - goal_emb).pow(2).sum(dim=-1)
         
         return total_energy
@@ -191,7 +183,7 @@ class GradientBasedSolver:
         batch: dict,
         goal_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the best action block found across `n_restarts` initializations."""
+        """Return the best raw action block found across `n_restarts` initializations."""
         device = goal_emb.device
         dtype = goal_emb.dtype
 
@@ -203,9 +195,11 @@ class GradientBasedSolver:
         best_actions = None
 
         for _ in range(self.n_restarts):
+            # Optimize directly over the chunked macro-actions: (1, horizon, chunk * dim)
             act_seq = torch.randn(
-                1, self.horizon, self.action_dim, device=device, dtype=dtype
+                1, self.horizon, self.action_chunk * self.action_dim, device=device, dtype=dtype
             )
+            
             if self.action_bounds is not None:
                 lo, hi = self.action_bounds
                 act_seq.clamp_(lo, hi)
@@ -239,7 +233,12 @@ class GradientBasedSolver:
                 best_energy = final_energy
                 best_actions = act_seq.detach().clone()
 
-        return best_actions[0, : self.action_block]
+        # best_actions is (1, horizon, chunk * dim). 
+        # Unpack it to a flat array of single steps: (horizon * chunk, dim)
+        best_acts_flat = best_actions[0].reshape(self.horizon * self.action_chunk, self.action_dim)
+        
+        # Return the requested action block length
+        return best_acts_flat[: self.action_block]
 
 
 class GradientWorldModelPolicy:
