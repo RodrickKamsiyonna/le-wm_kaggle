@@ -21,34 +21,25 @@ from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBa
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ResumableDataLoader(torch.utils.data.DataLoader):
-    """DataLoader that supports state_dict / load_state_dict for mid-epoch resume.
-
-    On checkpoint save, Lightning calls state_dict() and stores the number of
-    batches already consumed this epoch.  On resume, load_state_dict() restores
-    that count and __iter__ silently skips those batches so training picks up
-    exactly where it left off.
-    """
-
+    """DataLoader that supports state_dict / load_state_dict for mid-epoch resume."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._start_idx = 0  # batches already consumed this epoch
+        self._start_idx = 0
 
-    # ── checkpoint interface ──────────────────────────────────────────────────
     def state_dict(self):
         return {"start_idx": self._start_idx}
 
     def load_state_dict(self, state: dict):
         self._start_idx = state.get("start_idx", 0)
 
-    # ── skip already-seen batches on resume ───────────────────────────────────
     def __iter__(self):
         iterator = super().__iter__()
         for i, batch in enumerate(iterator):
             if i < self._start_idx:
-                continue          # fast-forward past consumed batches
-            self._start_idx = 0  # clear after the first yielded batch
+                continue
+            self._start_idx = 0
             yield batch
-        self._start_idx = 0       # full epoch done — reset for next epoch
+        self._start_idx = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,13 +48,11 @@ class ResumableDataLoader(torch.utils.data.DataLoader):
 
 def lejepa_forward1(self, batch, stage, cfg):
     """Encode observations, predict next states, compute losses (baseline)."""
-
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
 
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
-
     output = self.model.encode(batch)
 
     emb = output["emb"]
@@ -71,8 +60,8 @@ def lejepa_forward1(self, batch, stage, cfg):
 
     ctx_emb = emb[:, :ctx_len]
     ctx_act = act_emb[:, :ctx_len]
-
     tgt_emb = emb[:, n_preds:]
+    
     pred_emb = self.model.predict(ctx_emb, ctx_act)
 
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
@@ -86,7 +75,6 @@ def lejepa_forward1(self, batch, stage, cfg):
 
 def lejepa_forward(self, batch, stage, cfg):
     """Encode observations, predict next states, compute losses with EQM."""
-
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
@@ -115,18 +103,15 @@ def lejepa_forward(self, batch, stage, cfg):
 
         act_gamma = (
             gamma * ctx_actions_raw.detach() + (1 - gamma) * eps
-        ).requires_grad_(True)                          # (B, ctx_len, act_dim)
+        ).requires_grad_(True)
 
         pred_emb_noisy = self.model.predict(
             ctx_emb.detach(),
             self.model.action_encoder(act_gamma),
         )
 
-        # detach tgt_emb: target only, no cross-stream grad-fn kept alive
         energy = (pred_emb_noisy - tgt_emb.detach()).pow(2).sum(dim=-1).mean()
-
         grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
-
         target_grad = (eps - ctx_actions_raw.detach()) * eqm_lambda * (1 - gamma)
 
     output["pred_loss_eqm"] = (grad_energy - target_grad).pow(2).mean()
@@ -173,11 +158,25 @@ def get_latest_checkpoint(run_dir: Path, model_name: str):
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
 def run(cfg):
 
-    # ── dataset ───────────────────────────────────────────────────────────────
-    dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
+    # ── FIXED dataset loading ────────────────────────────────────────────────
+    
+    # 1. Resolve dataset config and pop the name out
+    dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
+    dataset_name = dataset_cfg.pop("name")
+    cache_dir = os.environ.get("LOCAL_DATASET_DIR", None)
+    
+    # 2. Use the stable_worldmodel factory function instead of direct class instantiation
+    dataset = swm.data.load_dataset(
+        dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
+    )
+
     transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)]
 
     with open_dict(cfg):
+        # We ensure wm dictionary exists to avoid AttributeError if config structure changed
+        if not hasattr(cfg, "wm"):
+            cfg.wm = {}
+            
         for col in cfg.data.dataset.keys_to_load:
             if col.startswith("pixels"):
                 continue
@@ -195,8 +194,6 @@ def run(cfg):
         generator=rnd_gen,
     )
 
-    # ResumableDataLoader — supports state_dict / load_state_dict so Lightning
-    # can skip already-consumed batches when resuming a mid-epoch checkpoint.
     train = ResumableDataLoader(
         train_set, **cfg.loader, shuffle=True, drop_last=True, generator=rnd_gen
     )
@@ -205,6 +202,7 @@ def run(cfg):
     )
 
     # ── model / optimiser ─────────────────────────────────────────────────────
+    
     encoder = spt.backbone.utils.vit_hf(
         cfg.encoder_scale,
         patch_size=cfg.patch_size,
@@ -215,7 +213,10 @@ def run(cfg):
 
     hidden_dim = encoder.config.hidden_size
     embed_dim = cfg.wm.get("embed_dim", hidden_dim)
-    effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
+    
+    # Safer action dimension extraction (prevents crash if 'action' isn't in keys_to_load)
+    action_dim = getattr(cfg.wm, "action_dim", dataset.get_dim("action"))
+    effective_act_dim = cfg.data.dataset.frameskip * action_dim
 
     predictor = ARPredictor(
         num_frames=cfg.wm.history_size,
@@ -290,7 +291,7 @@ def run(cfg):
         dirpath=run_dir,
         filename=f"{cfg.output_model_name}_step{{step}}",
         every_n_train_steps=500,
-        save_top_k=1,       # only keep the latest to save disk space
+        save_top_k=1,
         save_last=False,
     )
 
@@ -308,14 +309,13 @@ def run(cfg):
         enable_checkpointing=True,
     )
 
-    # Auto-resume from latest step checkpoint if one exists
     latest_ckpt = get_latest_checkpoint(run_dir, cfg.output_model_name)
 
     manager = spt.Manager(
         trainer=trainer,
         module=world_model,
         data=data_module,
-        ckpt_path=latest_ckpt,  # None → fresh run; path → mid-epoch resume
+        ckpt_path=latest_ckpt,
     )
 
     manager()
