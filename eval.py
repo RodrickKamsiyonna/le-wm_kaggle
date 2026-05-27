@@ -558,15 +558,16 @@ def run(cfg: DictConfig):
     results_path.mkdir(parents=True, exist_ok=True)
 
     start_time = time.time()
-    metrics = world.evaluate(
-        dataset=dataset,
+    metrics = world.evaluate_from_dataset(
+        dataset,
         start_steps=eval_start_idx.tolist(),
-        goal_offset=cfg.eval.goal_offset_steps,
+        goal_offset_steps=cfg.eval.goal_offset_steps,
         eval_budget=cfg.eval.eval_budget,
         episodes_idx=eval_episodes.tolist(),
         callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True),
-        video=results_path,
+        video_path=results_path,
     )
+
     end_time = time.time()
 
     print(metrics)
