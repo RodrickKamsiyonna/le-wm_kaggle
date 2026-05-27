@@ -5,7 +5,7 @@ defaults:
   - override /hydra/launcher: basic
 
 wandb:
-  enabled: False
+  enabled: True
   config:
     entity: lewm
     project: lewm
