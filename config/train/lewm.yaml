@@ -1,18 +1,15 @@
 defaults:
   - _self_
-  - launcher: local
   - data: pusht
-  - model: lewm
 
 output_model_name: lewm
 subdir: ${hydra:job.id}
 
+# ── Hardware & Scaling ────────────────────────────────────────────────────────
 num_workers: 2
 train_split: 0.9
 seed: 3072
-img_size: 224
-embed_dim: 192
-history_size: 3
+dump_object: True
 
 trainer:
   max_epochs: 10
@@ -33,9 +30,39 @@ optimizer:
   lr: 5e-5
   weight_decay: 1e-3
 
-num_preds: 1
+wandb:
+  enabled: True
+  config:
+    entity: lewm
+    project: lewm
+    name: ${output_model_name}
+    id: ${subdir}
+    resume: allow
+    log_model: False
 
+img_size: 224
+patch_size: 14
+encoder_scale: tiny
+
+wm:
+  type: lewm
+  history_size: 3
+  num_preds: 1
+  embed_dim: 192
+  action_chunk: 5
+
+predictor:
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+# ── Losses ────────────────────────────────────────────────────────────────────
 loss:
+  eqm_lambda: 1.0         # Controls energy target scaling in lejepa_forward
+  eqm_pred_weight: 0.5    # Controls total EQM loss weight
   sigreg:
     weight: 0.09
     kwargs:
