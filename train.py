@@ -158,16 +158,24 @@ def get_latest_checkpoint(run_dir: Path, model_name: str):
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
 def run(cfg):
 
-    # ── FIXED dataset loading ────────────────────────────────────────────────
-    
-    # 1. Resolve dataset config and pop the name out
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     dataset_name = dataset_cfg.pop("name")
     cache_dir = os.environ.get("LOCAL_DATASET_DIR", None)
     
-    # 2. Use the stable_worldmodel factory function instead of direct class instantiation
+    # --- BYPASS LIBRARY RESOLUTION BUG ---
+    # Construct the absolute path based on where we know the file is in Kaggle
+    absolute_path = f"/kaggle/working/stablewm/datasets/{dataset_name}.h5"
+    
+    if os.path.exists(absolute_path):
+        print(f"Bypassing resolver. Loading explicit path: {absolute_path}")
+        dataset_target = absolute_path
+    else:
+        # Fallback just in case
+        dataset_target = dataset_name
+    # -------------------------------------
+
     dataset = swm.data.load_dataset(
-        dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
+        dataset_target, transform=None, cache_dir=cache_dir, **dataset_cfg
     )
 
     transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)]
