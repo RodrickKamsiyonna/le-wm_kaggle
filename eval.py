@@ -338,7 +338,7 @@ class GradientWorldModelPolicy:
             else:
                 try:
                     batch[key] = torch.tensor(
-                        np.array(val, dtype=np.float32), dtype=torch.float32
+                        torch.from_numpy(np.array(val, dtype=np.float32))
                     ).unsqueeze(0)
                 except (TypeError, ValueError):
                     continue
