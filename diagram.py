@@ -240,7 +240,7 @@ def run_optimization_and_plot(
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def main(cfg: DictConfig):
     # Setup device
-    device = torch.device("cuda" if torch.cuda.is_device_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # 1. Load Model
