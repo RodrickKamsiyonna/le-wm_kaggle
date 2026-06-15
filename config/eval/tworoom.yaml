@@ -18,7 +18,6 @@ dataset:
   keys_to_cache:
     - action
     - proprio
-    - pixels
 
 plan_config:
   horizon: 5
