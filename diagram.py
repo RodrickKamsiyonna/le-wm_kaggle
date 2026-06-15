@@ -344,13 +344,23 @@ def run(cfg: DictConfig):
         return obs
 
     obs_dict  = row_to_obs(obs_data)
-    goal_dict = row_to_obs(goal_data)
+    raw_goal_dict = row_to_obs(goal_data)
 
-    # Rename goal pixel key if present
-    if "pixels" in goal_dict:
-        goal_dict_renamed = {"pixels": goal_dict["pixels"]}
-    else:
-        goal_dict_renamed = goal_dict
+    # Robust renaming mapping logic
+    goal_dict_renamed = {}
+    for k, v in raw_goal_dict.items():
+        if v is None:
+            continue
+        if k == "goal":
+            goal_dict_renamed["pixels"] = v
+        elif k.startswith("goal_"):
+            goal_dict_renamed[k[len("goal_"):]] = v
+        else:
+            goal_dict_renamed[k] = v
+
+    # Safety check to fail early and informatively
+    if "pixels" not in goal_dict_renamed:
+        raise KeyError("Image data missing! Ensure 'pixels' or 'goal' exists in your dataset and is listed in cfg.dataset.keys_to_cache")
 
     # ── Encode goal ───────────────────────────────────────────────────────────
     goal_emb = encode_goal(
