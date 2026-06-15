@@ -133,7 +133,7 @@ class DiagnosticSolver:
 
         return final_emb  # (1, hidden_dim)
 
-def solve(self, batch: dict, goal_emb: torch.Tensor) -> np.ndarray:
+    def solve(self, batch: dict, goal_emb: torch.Tensor) -> np.ndarray:
         """
         Optimise and record MSE at each iteration.
         Returns (action_block, action_dim) normalised numpy array.
@@ -149,7 +149,7 @@ def solve(self, batch: dict, goal_emb: torch.Tensor) -> np.ndarray:
         best_energy = float("inf")
         best_act_seq = None
         
-        # Store raw tensors during the loop to prevent CPU-GPU blocking
+        # Buffer to store raw tensors and prevent CPU-GPU sync lockups
         mse_tensor_history = []
 
         for restart in range(self.n_restarts):
@@ -179,8 +179,7 @@ def solve(self, batch: dict, goal_emb: torch.Tensor) -> np.ndarray:
                     if self.action_bounds is not None:
                         act_seq.data.clamp_(*self.action_bounds)
 
-                    # Fix 1 & 2: Calculate MSE from the detached terminal tensor from the forward pass
-                    # and append the tensor itself, NOT .item(), to avoid CPU syncs.
+                    # Calculate MSE directly from the tensor without triggering a CPU sync
                     mse_val = (terminal.detach() - goal_emb).pow(2).mean()
                     mse_tensor_history.append(mse_val)
 
@@ -189,19 +188,19 @@ def solve(self, batch: dict, goal_emb: torch.Tensor) -> np.ndarray:
                     (self._rollout_terminal(ctx_emb, ctx_act, act_seq) - goal_emb)
                     .pow(2)
                     .sum(dim=-1)
-                    .item() # Doing this once per restart is perfectly fine
+                    .item()
                 )
 
             if final_energy < best_energy:
                 best_energy = final_energy
                 best_act_seq = act_seq.detach().clone()
 
-        # Safely convert the history to floats all at once at the very end
+        # Safely extract floats from the GPU all at once at the very end
         self.mse_history = [m.item() for m in mse_tensor_history]
 
         executed = best_act_seq[0, :, -self.action_dim:]
         return executed[: self.action_block].cpu().numpy()
-    
+
 
 # ── Preprocessing (mirrors eval.py) ─────────────────────────────────────────
 
@@ -350,27 +349,12 @@ def run(cfg: DictConfig):
         return obs
 
     obs_dict  = row_to_obs(obs_data)
-    raw_goal_dict = row_to_obs(goal_data)
-
-    # Robust renaming mapping logic
-    goal_dict_renamed = {}
-    for k, v in raw_goal_dict.items():
-        if v is None:
-            continue
-        if k == "goal":
-            goal_dict_renamed["pixels"] = v
-        elif k.startswith("goal_"):
-            goal_dict_renamed[k[len("goal_"):]] = v
-        else:
-            goal_dict_renamed[k] = v
-
-    # Safety check to fail early and informatively
-    if "pixels" not in goal_dict_renamed:
-        raise KeyError("Image data missing! Ensure 'pixels' or 'goal' exists in your dataset and is listed in cfg.dataset.keys_to_cache")
+    goal_dict = row_to_obs(goal_data)
 
     # ── Encode goal ───────────────────────────────────────────────────────────
+    # Passing the full goal_dict naturally. No forced 'pixels' mapping.
     goal_emb = encode_goal(
-        goal_dict_renamed, model, process, transform, action_chunk, device
+        goal_dict, model, process, transform, action_chunk, device
     )  # (1, hidden_dim)
 
     # ── Build diagnostic solver ───────────────────────────────────────────────
