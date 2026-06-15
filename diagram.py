@@ -368,7 +368,7 @@ def main(cfg: DictConfig):
     grad_config = cfg.get("gradient_solver", {})
     
     # Force iterations to 50 for the diagram script, overriding config
-    grad_config["n_iter"] = 50 
+    grad_config["n_iter"] = 200
 
     run_optimization_and_plot(
         model,
