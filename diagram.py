@@ -133,7 +133,7 @@ class DiagnosticSolver:
 
         return final_emb  # (1, hidden_dim)
 
-    def solve(self, batch: dict, goal_emb: torch.Tensor) -> np.ndarray:
+def solve(self, batch: dict, goal_emb: torch.Tensor) -> np.ndarray:
         """
         Optimise and record MSE at each iteration.
         Returns (action_block, action_dim) normalised numpy array.
@@ -148,6 +148,9 @@ class DiagnosticSolver:
 
         best_energy = float("inf")
         best_act_seq = None
+        
+        # Store raw tensors during the loop to prevent CPU-GPU blocking
+        mse_tensor_history = []
 
         for restart in range(self.n_restarts):
             act_seq = torch.randn(
@@ -176,26 +179,29 @@ class DiagnosticSolver:
                     if self.action_bounds is not None:
                         act_seq.data.clamp_(*self.action_bounds)
 
-                    # Record MSE (mean over hidden dim, not sum) for readability
-                    t_emb = self._rollout_terminal(ctx_emb, ctx_act, act_seq)
-                    mse = (t_emb - goal_emb).pow(2).mean().item()
-                    self.mse_history.append(mse)
+                    # Fix 1 & 2: Calculate MSE from the detached terminal tensor from the forward pass
+                    # and append the tensor itself, NOT .item(), to avoid CPU syncs.
+                    mse_val = (terminal.detach() - goal_emb).pow(2).mean()
+                    mse_tensor_history.append(mse_val)
 
             with torch.no_grad():
                 final_energy = (
                     (self._rollout_terminal(ctx_emb, ctx_act, act_seq) - goal_emb)
                     .pow(2)
                     .sum(dim=-1)
-                    .item()
+                    .item() # Doing this once per restart is perfectly fine
                 )
 
             if final_energy < best_energy:
                 best_energy = final_energy
                 best_act_seq = act_seq.detach().clone()
 
+        # Safely convert the history to floats all at once at the very end
+        self.mse_history = [m.item() for m in mse_tensor_history]
+
         executed = best_act_seq[0, :, -self.action_dim:]
         return executed[: self.action_block].cpu().numpy()
-
+    
 
 # ── Preprocessing (mirrors eval.py) ─────────────────────────────────────────
 
