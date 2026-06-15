@@ -235,11 +235,65 @@ def preprocess_obs(obs, process, transform, action_chunk):
 
 
 @torch.no_grad()
-def encode_goal(obs_dict, model, process, transform, action_chunk, device):
-    batch = preprocess_obs(obs_dict, process, transform, action_chunk)
-    batch = {k: v.to(device) for k, v in batch.items()}
-    return model.encode(batch)["emb"][:, -1]
+def encode_goal(
+    obs_dict,
+    model,
+    process,
+    transform,
+    action_chunk,
+    device,
+):
+    """
+    Encode a goal observation into latent space.
 
+    The JEPA encoder expects a 'pixels' tensor.
+    Some datasets store the goal image under a different name,
+    so we explicitly map it before preprocessing.
+    """
+
+    goal_obs = dict(obs_dict)
+
+    # -------------------------------------------------------
+    # Ensure encoder always receives a 'pixels' field
+    # -------------------------------------------------------
+    if "pixels" not in goal_obs:
+
+        if "goal_pixels" in goal_obs:
+            goal_obs["pixels"] = goal_obs["goal_pixels"]
+
+        elif "goal" in goal_obs:
+            goal_obs["pixels"] = goal_obs["goal"]
+
+        else:
+            available = list(goal_obs.keys())
+            raise KeyError(
+                f"Goal observation contains no image.\n"
+                f"Available keys: {available}\n"
+                f"Expected one of: pixels, goal_pixels, goal"
+            )
+
+    batch = preprocess_obs(
+        goal_obs,
+        process,
+        transform,
+        action_chunk,
+    )
+
+    batch = {
+        k: v.to(device)
+        for k, v in batch.items()
+    }
+
+    if "pixels" not in batch:
+        raise KeyError(
+            f"Preprocessed goal batch still missing 'pixels'. "
+            f"Keys found: {list(batch.keys())}"
+        )
+
+    output = model.encode(batch)
+
+    return output["emb"][:, -1]
+    
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
