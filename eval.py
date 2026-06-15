@@ -401,6 +401,32 @@ class BatchedGradientWorldModelPolicy:
         return actions
 
 
+def _extract_success_rate(metrics: dict) -> float:
+    """
+    Pull the scalar success rate out of whatever structure
+    world.evaluate_from_dataset returns.
+
+    Tries common key names in order; falls back to the first numeric value
+    found if none match.
+    """
+    candidates = ("success_rate", "success", "avg_success", "mean_success")
+    for key in candidates:
+        if key in metrics:
+            val = metrics[key]
+            return float(val) if not hasattr(val, "__len__") else float(np.mean(val))
+
+    # Fallback: first numeric scalar in the dict
+    for val in metrics.values():
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            continue
+
+    raise KeyError(
+        f"Could not find a success-rate field in metrics dict. Keys: {list(metrics.keys())}"
+    )
+
+
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
     assert (
@@ -408,6 +434,10 @@ def run(cfg: DictConfig):
     ), "Planning horizon must be smaller than or equal to eval_budget"
 
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
+
+    # Number of independent experiment repetitions (override via
+    # +num_experiments=N on the command line if needed).
+    num_experiments: int = cfg.get("num_experiments", 50)
 
     world = swm.World(
         env_name=cfg.world.env_name,
@@ -426,7 +456,7 @@ def run(cfg: DictConfig):
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
     ep_indices, _ = np.unique(stats_dataset.get_col_data(col_name), return_index=True)
 
-    # ── Build per-column StandardScalers ─────────────────────────────────────
+    # ── Build per-column StandardScalers (once, shared across experiments) ───
     process = {}
     for col in cfg.dataset.keys_to_cache:
         if col in ["pixels"]:
@@ -511,7 +541,9 @@ def run(cfg: DictConfig):
         if policy_name != "random"
         else Path(__file__).parent
     )
+    results_path.mkdir(parents=True, exist_ok=True)
 
+    # ── Pre-compute valid starting points once ───────────────────────────────
     episode_len = get_episodes_length(dataset, ep_indices)
     max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
     max_start_idx_dict = {
@@ -523,37 +555,91 @@ def run(cfg: DictConfig):
 
     valid_mask    = dataset.get_col_data("step_idx") <= max_start_per_row
     valid_indices = np.nonzero(valid_mask)[0]
-    print(valid_mask.sum(), "valid starting points found for evaluation.")
-
-    g = np.random.default_rng(cfg.seed)
-    random_episode_indices = g.choice(
-        len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False
-    )
-    random_episode_indices = np.sort(valid_indices[random_episode_indices])
-
-    eval_episodes  = dataset.get_row_data(random_episode_indices)[col_name]
-    eval_start_idx = dataset.get_row_data(random_episode_indices)["step_idx"]
-
-    if len(eval_episodes) < cfg.eval.num_eval:
-        raise ValueError("Not enough episodes with sufficient length for evaluation.")
+    print(f"{valid_mask.sum()} valid starting points found for evaluation.")
 
     world.set_policy(policy)
-    results_path.mkdir(parents=True, exist_ok=True)
 
-    start_time = time.time()
-    metrics = world.evaluate_from_dataset(
-        dataset,
-        start_steps=eval_start_idx.tolist(),
-        goal_offset_steps=cfg.eval.goal_offset_steps,
-        eval_budget=cfg.eval.eval_budget,
-        episodes_idx=eval_episodes.tolist(),
-        callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True),
-        video_path=results_path,
+    # ── Repeated experiment loop ─────────────────────────────────────────────
+    # Each experiment draws a fresh independent random sample of episodes so
+    # that the per-experiment success rates are not correlated by sample overlap.
+    # We derive each experiment's seed deterministically from cfg.seed so that
+    # runs are fully reproducible.
+    all_success_rates: list[float] = []
+    all_metrics: list[dict] = []
+    total_start = time.time()
+
+    print(f"\nRunning {num_experiments} independent experiments "
+          f"({cfg.eval.num_eval} episodes each) …\n")
+
+    for exp_idx in range(num_experiments):
+        exp_seed = cfg.seed + exp_idx  # deterministic but distinct per experiment
+        g = np.random.default_rng(exp_seed)
+
+        random_episode_indices = g.choice(
+            len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False
+        )
+        random_episode_indices = np.sort(valid_indices[random_episode_indices])
+
+        eval_episodes  = dataset.get_row_data(random_episode_indices)[col_name]
+        eval_start_idx = dataset.get_row_data(random_episode_indices)["step_idx"]
+
+        if len(eval_episodes) < cfg.eval.num_eval:
+            raise ValueError(
+                f"Experiment {exp_idx}: not enough episodes with sufficient length."
+            )
+
+        # Reset the policy buffer between experiments so stale actions from
+        # the previous run don't bleed into the next one.
+        if hasattr(policy, "reset"):
+            policy.reset()
+
+        exp_start = time.time()
+        metrics = world.evaluate_from_dataset(
+            dataset,
+            start_steps=eval_start_idx.tolist(),
+            goal_offset_steps=cfg.eval.goal_offset_steps,
+            eval_budget=cfg.eval.eval_budget,
+            episodes_idx=eval_episodes.tolist(),
+            callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True),
+            video_path=results_path,
+        )
+        exp_elapsed = time.time() - exp_start
+
+        success_rate = _extract_success_rate(metrics)
+        all_success_rates.append(success_rate)
+        all_metrics.append(metrics)
+
+        print(
+            f"  Experiment {exp_idx + 1:3d}/{num_experiments}  "
+            f"success_rate={success_rate:.4f}  "
+            f"elapsed={exp_elapsed:.1f}s"
+        )
+
+    total_elapsed = time.time() - total_start
+
+    # ── Aggregate statistics ─────────────────────────────────────────────────
+    rates = np.array(all_success_rates)
+    mean_sr  = float(np.mean(rates))
+    std_sr   = float(np.std(rates, ddof=1))   # sample std (ddof=1)
+    # 95 % confidence interval via t-distribution approximation (large n → ≈ 1.96)
+    se_sr    = std_sr / np.sqrt(len(rates))
+    ci95_lo  = mean_sr - 1.96 * se_sr
+    ci95_hi  = mean_sr + 1.96 * se_sr
+
+    summary = (
+        f"\n{'=' * 60}\n"
+        f"REPEATED EVALUATION SUMMARY  ({num_experiments} experiments)\n"
+        f"{'=' * 60}\n"
+        f"  Mean success rate : {mean_sr:.4f}\n"
+        f"  Std  success rate : {std_sr:.4f}\n"
+        f"  95% CI            : [{ci95_lo:.4f}, {ci95_hi:.4f}]\n"
+        f"  Min / Max         : {rates.min():.4f} / {rates.max():.4f}\n"
+        f"  Total time        : {total_elapsed:.1f}s\n"
+        f"{'=' * 60}\n"
     )
-    end_time = time.time()
+    print(summary)
 
-    print(metrics)
-
+    # ── Persist results ──────────────────────────────────────────────────────
     out_path = results_path / cfg.output.filename
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -562,9 +648,11 @@ def run(cfg: DictConfig):
         f.write("==== CONFIG ====\n")
         f.write(OmegaConf.to_yaml(cfg))
         f.write("\n")
-        f.write("==== RESULTS ====\n")
-        f.write(f"metrics: {metrics}\n")
-        f.write(f"evaluation_time: {end_time - start_time} seconds\n")
+        f.write(summary)
+        f.write("\n==== PER-EXPERIMENT RESULTS ====\n")
+        for i, (sr, m) in enumerate(zip(all_success_rates, all_metrics)):
+            f.write(f"experiment_{i:03d}: success_rate={sr:.4f}  metrics={m}\n")
+        f.write(f"\ntotal_evaluation_time: {total_elapsed:.1f} seconds\n")
 
 
 if __name__ == "__main__":
