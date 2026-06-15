@@ -218,7 +218,7 @@ def run_optimization_and_plot(
     plt.figure(figsize=(10, 6))
     plt.plot(range(1, n_iter + 1), mse_history, marker='.', linestyle='-', color='b')
     plt.title(f'Planning Optimization: Predicted vs Goal Embedding MSE\n'
-              f'(Horizon: {horizon}, Dataset: {plan_cfg.dataset_name})')
+              f'(Horizon: {horizon})')
     plt.xlabel('Gradient Descent Iteration')
     plt.ylabel('Mean Squared Error (Summed over Latent Dim)')
     plt.grid(True, which="both", ls="-", alpha=0.5)
