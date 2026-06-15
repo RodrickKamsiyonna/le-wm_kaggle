@@ -318,7 +318,11 @@ def main(cfg: DictConfig):
     
     # Construct context dict. values shape: (T, ...)
     context_data = {}
-    for key in cfg.dataset.keys_to_cache:
+    for key in context_rows.keys():  # <-- Changed this line
+        # Skip metadata columns just to be safe
+        if key in ["episode_idx", "ep_idx", "step_idx"]: 
+            continue
+            
         data = context_rows[key]
         if actual_ctx_len < ctx_len:
             # Pad beginning by repeating first frame
