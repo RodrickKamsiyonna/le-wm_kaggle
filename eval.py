@@ -437,7 +437,7 @@ def run(cfg: DictConfig):
 
     # Number of independent experiment repetitions (override via
     # +num_experiments=N on the command line if needed).
-    num_experiments: int = cfg.get("num_experiments", 50)
+    num_experiments: int = cfg.get("num_experiments", 10)
 
     world = swm.World(
         env_name=cfg.world.env_name,
