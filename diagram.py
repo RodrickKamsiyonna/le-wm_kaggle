@@ -223,10 +223,6 @@ def run_optimization_and_plot(
     plt.ylabel('Mean Squared Error (Summed over Latent Dim)')
     plt.grid(True, which="both", ls="-", alpha=0.5)
     
-    # Add info text box
-    info_text = (f"Final MSE: {mse_history[-1]:.5f}\n"
-                 f"Total Time: {total_time:.1f}s\n"
-                 f"LR: {grad_cfg.get('lr')}")
     plt.gca().text(0.95, 0.95, info_text, transform=plt.gca().transAxes,
                     fontsize=10, verticalalignment='top', horizontalalignment='right',
                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
