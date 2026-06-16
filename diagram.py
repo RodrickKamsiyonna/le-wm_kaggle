@@ -222,10 +222,6 @@ def run_optimization_and_plot(
     plt.xlabel('Gradient Descent Iteration')
     plt.ylabel('Mean Squared Error (Summed over Latent Dim)')
     plt.grid(True, which="both", ls="-", alpha=0.5)
-    
-    plt.gca().text(0.95, 0.95, info_text, transform=plt.gca().transAxes,
-                    fontsize=10, verticalalignment='top', horizontalalignment='right',
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
     output_filename = "plan_optimization_curve.png"
     plt.savefig(output_filename, dpi=150)
