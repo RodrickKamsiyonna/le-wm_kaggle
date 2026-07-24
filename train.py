@@ -123,7 +123,7 @@ def lejepa_forward(self, batch, stage, cfg):
         )
 
         # detach tgt_emb: target only, no cross-stream grad-fn kept alive
-        energy = (pred_emb_noisy - tgt_emb.detach()).pow(2).sum(dim=-1).mean()
+        energy = (pred_emb_noisy - tgt_emb.detach()).pow(2).sum(dim=-1).sum()
 
         grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
 
