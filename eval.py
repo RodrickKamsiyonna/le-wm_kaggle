@@ -11,6 +11,7 @@ import stable_pretraining as spt
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
+from scipy import stats
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
@@ -58,21 +59,33 @@ class BatchedGradientSolver:
     pass scales linearly in B and avoids repeated Python-level loops.
 
     The energy tensor has shape (B,) and gradients flow independently to
-    each environment's act_seq slice.
+    each environment's act_seq slice. Gradient clipping is likewise applied
+    independently per environment (see _clip_grad_norm_per_env) so that one
+    environment's gradient magnitude cannot suppress another's update.
 
     Args:
-        model:          JEPA world model.
-        action_dim:     Dimensionality of a single raw action vector.
-        horizon:        Number of latent rollout steps.
-        action_block:   Steps to execute before re-planning.
-        ctx_len:        History window length (cfg.wm.history_size).
-        action_chunk:   Consecutive actions per encoder input.
-        n_iter:         Gradient-descent iterations.
-        lr:             Adam learning rate.
-        grad_clip:      Max grad norm.
-        n_restarts:     Independent random restarts per planning call.
-        action_noise:   Std of Gaussian noise after each grad step.
-        action_bounds:  Optional (low, high) clamp in normalised space.
+        model:               JEPA world model.
+        action_dim:          Dimensionality of a single raw action vector.
+        horizon:             Number of latent rollout steps.
+        action_block:        Steps to execute before re-planning.
+        ctx_len:             History window length (cfg.wm.history_size).
+        action_chunk:        Consecutive actions per encoder input.
+        n_iter:              Gradient-descent iterations.
+        lr:                  Adam learning rate.
+        grad_clip:           Max per-environment grad norm.
+        n_restarts:          Independent random restarts per planning call.
+        action_noise:        Std of Gaussian noise after each grad step.
+        action_bounds:       Optional (low, high) clamp in normalised space.
+                              Each of low/high may be a scalar or a
+                              per-action-dimension array of shape
+                              (action_dim,); arrays are tiled across
+                              action_chunk internally.
+        action_chunk_order:  Which slice of each predicted macro-action
+                              chunk is actually executed next. "first"
+                              (default) executes the nearest-term action in
+                              the chunk; "last" executes the most distant
+                              one. Set this to match how your action
+                              encoder orders actions within a chunk.
     """
 
     def __init__(
@@ -89,8 +102,10 @@ class BatchedGradientSolver:
         n_restarts: int = 4,
         action_noise: float = 0.0,
         action_bounds: tuple | None = None,
+        action_chunk_order: str = "first",
     ):
         assert action_block <= horizon
+        assert action_chunk_order in ("first", "last")
         self.model = model
         self.action_dim = action_dim
         self.horizon = horizon
@@ -104,6 +119,59 @@ class BatchedGradientSolver:
         self.n_restarts = n_restarts
         self.action_noise = action_noise
         self.action_bounds = action_bounds
+        self.action_chunk_order = action_chunk_order
+        self._bounds_cache = None  # lazily-built (lo_tensor, hi_tensor) on the right device/dtype
+
+    def _get_bounds_tensor(self, device, dtype):
+        """
+        Build (and cache) per-element clamp tensors of shape (chunk_dim,)
+        from self.action_bounds. Supports either a scalar bound (applied to
+        every action dimension) or a per-dimension array of shape
+        (action_dim,), tiled across action_chunk repeats so it broadcasts
+        correctly against act_seq's last dimension (chunk_dim).
+        """
+        if self.action_bounds is None:
+            return None, None
+
+        cached = self._bounds_cache
+        if cached is not None and cached[0].device == device and cached[0].dtype == dtype:
+            return cached
+
+        lo, hi = self.action_bounds
+        lo_arr = np.broadcast_to(np.asarray(lo, dtype=np.float32), (self.action_dim,))
+        hi_arr = np.broadcast_to(np.asarray(hi, dtype=np.float32), (self.action_dim,))
+        lo_tiled = np.tile(lo_arr, self.action_chunk)  # (chunk_dim,)
+        hi_tiled = np.tile(hi_arr, self.action_chunk)  # (chunk_dim,)
+
+        lo_t = torch.tensor(lo_tiled, device=device, dtype=dtype)
+        hi_t = torch.tensor(hi_tiled, device=device, dtype=dtype)
+        self._bounds_cache = (lo_t, hi_t)
+        return self._bounds_cache
+
+    def _clamp_action_bounds(self, act_seq: torch.Tensor) -> None:
+        lo_t, hi_t = self._get_bounds_tensor(act_seq.device, act_seq.dtype)
+        if lo_t is not None:
+            act_seq.data.clamp_(min=lo_t, max=hi_t)
+
+    @staticmethod
+    def _clip_grad_norm_per_env(param: torch.Tensor, max_norm: float) -> None:
+        """
+        Clip param.grad's L2 norm independently for each batch element
+        (dim 0), instead of computing one global norm over the whole
+        batched tensor. Using torch.nn.utils.clip_grad_norm_ directly on a
+        (B, ...) tensor would compute a single shared norm across all B
+        environments, so one environment with a large-magnitude gradient
+        would suppress the updates of every other environment in the same
+        batch. This keeps clipping — and therefore optimization — fully
+        independent per environment.
+        """
+        grad = param.grad
+        if grad is None or max_norm is None:
+            return
+        flat = grad.reshape(grad.shape[0], -1)          # (B, -)
+        norms = flat.norm(p=2, dim=1)                    # (B,)
+        scale = (max_norm / (norms + 1e-6)).clamp(max=1.0)  # (B,)
+        grad.mul_(scale.view(-1, *([1] * (grad.dim() - 1))))
 
     @torch.no_grad()
     def _encode_context_batch(
@@ -193,9 +261,7 @@ class BatchedGradientSolver:
             act_seq = torch.randn(
                 B, self.horizon, self.chunk_dim, device=device, dtype=dtype
             )
-            if self.action_bounds is not None:
-                lo, hi = self.action_bounds
-                act_seq.data.clamp_(lo, hi)
+            self._clamp_action_bounds(act_seq)
             act_seq = act_seq.requires_grad_(True)
 
             optimizer = torch.optim.Adam([act_seq], lr=self.lr)
@@ -207,16 +273,14 @@ class BatchedGradientSolver:
                 energy.sum().backward()
 
                 if self.grad_clip is not None:
-                    torch.nn.utils.clip_grad_norm_([act_seq], self.grad_clip)
+                    self._clip_grad_norm_per_env(act_seq, self.grad_clip)
 
                 optimizer.step()
 
                 with torch.no_grad():
                     if self.action_noise > 0.0:
                         act_seq.data += self.action_noise * torch.randn_like(act_seq)
-                    if self.action_bounds is not None:
-                        lo, hi = self.action_bounds
-                        act_seq.data.clamp_(lo, hi)
+                    self._clamp_action_bounds(act_seq)
 
             with torch.no_grad():
                 final_energy = self._compute_energy_batch(
@@ -228,9 +292,12 @@ class BatchedGradientSolver:
             best_energy = torch.where(improved, final_energy, best_energy)
             best_act_seq[improved] = act_seq.detach()[improved]
 
-        # Extract single-step actions: last action_dim values of each chunk
-        # best_act_seq: (B, horizon, chunk_dim)
-        executed = best_act_seq[:, :, -self.action_dim:]  # (B, horizon, action_dim)
+        # Extract single-step actions from each chunk according to
+        # action_chunk_order (see class docstring).
+        if self.action_chunk_order == "first":
+            executed = best_act_seq[:, :, : self.action_dim]
+        else:
+            executed = best_act_seq[:, :, -self.action_dim:]
         return executed[:, : self.action_block].cpu().numpy()  # (B, action_block, action_dim)
 
 
@@ -430,7 +497,7 @@ def _extract_success_rate(metrics: dict) -> float:
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
     assert (
-        cfg.plan_config.horizon * cfg.plan_config.action_block <= cfg.eval.eval_budget
+        cfg.plan_config.horizon <= cfg.eval.eval_budget
     ), "Planning horizon must be smaller than or equal to eval_budget"
 
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
@@ -446,9 +513,12 @@ def run(cfg: DictConfig):
         image_shape=(224, 224),
     )
 
+    # Goal observations are re-keyed from "goal"/"goal_<field>" to
+    # "pixels"/"<field>" before preprocessing (see
+    # BatchedGradientWorldModelPolicy.get_action), so a single "pixels"
+    # entry here covers both the live observation and the goal image.
     transform = {
         "pixels": img_transform(cfg),
-        "goal":   img_transform(cfg),
     }
 
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
@@ -466,8 +536,6 @@ def run(cfg: DictConfig):
         col_data = col_data[~np.isnan(col_data).any(axis=1)]
         processor.fit(col_data)
         process[col] = processor
-        if col != "action":
-            process[f"goal_{col}"] = process[col]
 
     policy_name = cfg.get("policy", "random")
     if policy_name != "random":
@@ -504,12 +572,15 @@ def run(cfg: DictConfig):
         action_bounds = None
         if grad_cfg.get("action_bounds"):
             raw_lo, raw_hi = grad_cfg.action_bounds
+            # Full per-dimension normalised bounds (not just dimension 0),
+            # since different action dimensions can have different
+            # mean/scale under the StandardScaler.
             norm_lo = process["action"].transform(
                 np.array([[raw_lo] * raw_action_dim], dtype=np.float32)
-            )[0, 0]
+            )[0]
             norm_hi = process["action"].transform(
                 np.array([[raw_hi] * raw_action_dim], dtype=np.float32)
-            )[0, 0]
+            )[0]
             action_bounds = (norm_lo, norm_hi)
 
         solver = BatchedGradientSolver(
@@ -525,6 +596,7 @@ def run(cfg: DictConfig):
             n_restarts=grad_cfg.get("n_restarts", 4),
             action_noise=grad_cfg.get("action_noise", 0.0),
             action_bounds=action_bounds,
+            action_chunk_order=grad_cfg.get("action_chunk_order", "first"),
         )
 
         policy = BatchedGradientWorldModelPolicy(
@@ -575,23 +647,26 @@ def run(cfg: DictConfig):
         exp_seed = cfg.seed + exp_idx  # deterministic but distinct per experiment
         g = np.random.default_rng(exp_seed)
 
+        # len(valid_indices), not len(valid_indices) - 1: Generator.choice(n)
+        # samples from [0, n), so subtracting 1 would make the last valid
+        # starting point unreachable.
         random_episode_indices = g.choice(
-            len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False
+            len(valid_indices), size=cfg.eval.num_eval, replace=False
         )
         random_episode_indices = np.sort(valid_indices[random_episode_indices])
 
         eval_episodes  = dataset.get_row_data(random_episode_indices)[col_name]
         eval_start_idx = dataset.get_row_data(random_episode_indices)["step_idx"]
 
-        if len(eval_episodes) < cfg.eval.num_eval:
-            raise ValueError(
-                f"Experiment {exp_idx}: not enough episodes with sufficient length."
-            )
-
         # Reset the policy buffer between experiments so stale actions from
         # the previous run don't bleed into the next one.
         if hasattr(policy, "reset"):
             policy.reset()
+
+        # Separate video subdirectory per experiment so repeated runs don't
+        # overwrite each other's recordings.
+        exp_video_path = results_path / f"exp_{exp_idx:03d}"
+        exp_video_path.mkdir(parents=True, exist_ok=True)
 
         exp_start = time.time()
         metrics = world.evaluate_from_dataset(
@@ -601,7 +676,7 @@ def run(cfg: DictConfig):
             eval_budget=cfg.eval.eval_budget,
             episodes_idx=eval_episodes.tolist(),
             callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True),
-            video_path=results_path,
+            video_path=exp_video_path,
         )
         exp_elapsed = time.time() - exp_start
 
@@ -619,12 +694,21 @@ def run(cfg: DictConfig):
 
     # ── Aggregate statistics ─────────────────────────────────────────────────
     rates = np.array(all_success_rates)
-    mean_sr  = float(np.mean(rates))
-    std_sr   = float(np.std(rates, ddof=1))   # sample std (ddof=1)
-    # 95 % confidence interval via t-distribution approximation (large n → ≈ 1.96)
-    se_sr    = std_sr / np.sqrt(len(rates))
-    ci95_lo  = mean_sr - 1.96 * se_sr
-    ci95_hi  = mean_sr + 1.96 * se_sr
+    n_exp = len(rates)
+    mean_sr = float(np.mean(rates))
+
+    if n_exp > 1:
+        std_sr = float(np.std(rates, ddof=1))  # sample std (ddof=1)
+        se_sr = std_sr / np.sqrt(n_exp)
+        # Exact t-distribution critical value for a 95% CI (not the large-n
+        # normal approximation of 1.96), since num_experiments defaults to 10.
+        t_crit = float(stats.t.ppf(0.975, df=n_exp - 1))
+        ci95_lo = mean_sr - t_crit * se_sr
+        ci95_hi = mean_sr + t_crit * se_sr
+    else:
+        std_sr = float("nan")
+        ci95_lo = ci95_hi = mean_sr
+        print("Only one experiment was run; std/95% CI are undefined.")
 
     summary = (
         f"\n{'=' * 60}\n"
