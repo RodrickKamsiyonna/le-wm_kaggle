@@ -91,23 +91,17 @@ def run(cfg: DictConfig):
             ckpt_path += ".ckpt"  # Ensure it looks for a .ckpt file
             
         print(f"Loading local PyTorch model from {ckpt_path}...")
-        model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        
-        model = model.to("cuda")
+        model = torch.load(ckpt_path, map_location="cpu", weights_only=False)        
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
         config = swm.PlanConfig(**cfg.plan_config)
-        solver = hydra.utils.instantiate(cfg.solver, model=model)
-        if hasattr(solver, "to"):
-            solver = solver.to("cuda")
-        
+        solver = hydra.utils.instantiate(cfg.solver, model=model)        
         policy = swm.policy.WorldModelPolicy(
             solver=solver, 
             config=config, 
             process=process, 
             transform=transform,
-            device="cuda" 
         )
     else:
         policy = swm.policy.RandomPolicy()
