@@ -1,4 +1,5 @@
 import os
+
 os.environ["MUJOCO_GL"] = "egl"
 
 import time
@@ -12,6 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
+
 
 def img_transform(cfg):
     transform = transforms.Compose(
@@ -44,6 +46,28 @@ def get_dataset(cfg, dataset_name):
         cache_dir=dataset_path,
     )
     return dataset
+
+
+class CUDASolverWrapper:
+    """Wraps the solver to temporarily force CUDA tensor creation during its execution."""
+    def __init__(self, solver):
+        self.solver = solver
+        
+    def __call__(self, *args, **kwargs):
+        # Save current device
+        old_device = torch.get_default_device()
+        # Switch to CUDA just for the solver to fix the internal CPU-tensor bug
+        torch.set_default_device("cuda")
+        try:
+            res = self.solver(*args, **kwargs)
+        finally:
+            # Safely restore CPU so the environment indexing doesn't crash
+            torch.set_default_device(old_device)
+        return res
+        
+    def __getattr__(self, attr):
+        return getattr(self.solver, attr)
+
 
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
@@ -92,16 +116,21 @@ def run(cfg: DictConfig):
         print(f"Loading local PyTorch model from {ckpt_path}...")
         model = torch.load(ckpt_path, map_location="cpu", weights_only=False)        
         
+        # Explicitly move the model to the GPU
         model = model.to("cuda")
-        
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
-        config = swm.PlanConfig(**cfg.plan_config)
-        solver = hydra.utils.instantiate(cfg.solver, model=model)        
         
+        config = swm.PlanConfig(**cfg.plan_config)
+        
+        # Instantiate and move the solver to CUDA
+        solver = hydra.utils.instantiate(cfg.solver, model=model)        
         if hasattr(solver, "to"):
             solver = solver.to("cuda")
+            
+        # Wrap the solver in our surgical CUDA patch
+        solver = CUDASolverWrapper(solver)
             
         policy = swm.policy.WorldModelPolicy(
             solver=solver, 
@@ -152,7 +181,6 @@ def run(cfg: DictConfig):
     world.set_policy(policy)
     results_path.mkdir(parents=True, exist_ok=True)
 
-
     start_time = time.time()
     metrics = world.evaluate(
         dataset=dataset,
@@ -164,9 +192,6 @@ def run(cfg: DictConfig):
         video=results_path,
     )
     end_time = time.time()
-    
-    # --- Clean up default device back to CPU just in case ---
-    torch.set_default_device("cpu")
     
     print(metrics)
 
