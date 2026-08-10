@@ -99,11 +99,16 @@ def run(cfg: DictConfig):
         model.interpolate_pos_encoding = True
         config = swm.PlanConfig(**cfg.plan_config)
         solver = hydra.utils.instantiate(cfg.solver, model=model)
-        solver = solver.to("cuda")
+        if hasattr(solver, "to"):
+            solver = solver.to("cuda")
+        
         policy = swm.policy.WorldModelPolicy(
-            solver=solver, config=config, process=process, transform=transform
+            solver=solver, 
+            config=config, 
+            process=process, 
+            transform=transform,
+            device="cuda" 
         )
-
     else:
         policy = swm.policy.RandomPolicy()
 
