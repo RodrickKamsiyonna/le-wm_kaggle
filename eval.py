@@ -85,7 +85,15 @@ def run(cfg: DictConfig):
     policy = cfg.get("policy", "random")
 
     if policy != "random":
-        model = swm.wm.utils.load_pretrained(cfg.policy)
+        
+        ckpt_path = cfg.policy 
+        if not ckpt_path.endswith(".ckpt"):
+            ckpt_path += ".ckpt"  # Ensure it looks for a .ckpt file
+            
+        print(f"Loading local PyTorch model from {ckpt_path}...")
+        model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        
+        model = model.to("cuda")
         model = model.to("cuda")
         model = model.eval()
         model.requires_grad_(False)
