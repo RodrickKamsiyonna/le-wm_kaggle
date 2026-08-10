@@ -48,27 +48,6 @@ def get_dataset(cfg, dataset_name):
     return dataset
 
 
-class CUDASolverWrapper:
-    """Wraps the solver to temporarily force CUDA tensor creation during its execution."""
-    def __init__(self, solver):
-        self.solver = solver
-        
-    def __call__(self, *args, **kwargs):
-        # Save current device
-        old_device = torch.get_default_device()
-        # Switch to CUDA just for the solver to fix the internal CPU-tensor bug
-        torch.set_default_device("cuda")
-        try:
-            res = self.solver(*args, **kwargs)
-        finally:
-            # Safely restore CPU so the environment indexing doesn't crash
-            torch.set_default_device(old_device)
-        return res
-        
-    def __getattr__(self, attr):
-        return getattr(self.solver, attr)
-
-
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
     """Run evaluation of dinowm vs random policy."""
@@ -129,8 +108,21 @@ def run(cfg: DictConfig):
         if hasattr(solver, "to"):
             solver = solver.to("cuda")
             
-        # Wrap the solver in our surgical CUDA patch
-        solver = CUDASolverWrapper(solver)
+        # --- NEW FIX: Monkey-patch the solve method directly ---
+        # This preserves the class type so isinstance(solver, Solver) passes!
+        original_solve = solver.solve
+        
+        def patched_solve(*args, **kwargs):
+            old_device = torch.get_default_device()
+            torch.set_default_device("cuda")
+            try:
+                res = original_solve(*args, **kwargs)
+            finally:
+                torch.set_default_device(old_device)
+            return res
+            
+        solver.solve = patched_solve
+        # --------------------------------------------------------
             
         policy = swm.policy.WorldModelPolicy(
             solver=solver, 
