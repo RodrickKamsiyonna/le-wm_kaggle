@@ -94,12 +94,12 @@ def run(cfg: DictConfig):
         model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         
         model = model.to("cuda")
-        model = model.to("cuda")
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
         config = swm.PlanConfig(**cfg.plan_config)
         solver = hydra.utils.instantiate(cfg.solver, model=model)
+        solver = solver.to("cuda")
         policy = swm.policy.WorldModelPolicy(
             solver=solver, config=config, process=process, transform=transform
         )
