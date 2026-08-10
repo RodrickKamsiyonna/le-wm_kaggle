@@ -1,5 +1,4 @@
 import os
-
 os.environ["MUJOCO_GL"] = "egl"
 
 import time
@@ -92,11 +91,20 @@ def run(cfg: DictConfig):
             
         print(f"Loading local PyTorch model from {ckpt_path}...")
         model = torch.load(ckpt_path, map_location="cpu", weights_only=False)        
+        
+        # --- FIX 1: Explicitly move the model to the GPU ---
+        model = model.to("cuda")
+        
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
         config = swm.PlanConfig(**cfg.plan_config)
         solver = hydra.utils.instantiate(cfg.solver, model=model)        
+        
+        # --- FIX 2: Explicitly move the solver to the GPU ---
+        if hasattr(solver, "to"):
+            solver = solver.to("cuda")
+            
         policy = swm.policy.WorldModelPolicy(
             solver=solver, 
             config=config, 
@@ -144,8 +152,10 @@ def run(cfg: DictConfig):
         raise ValueError("Not enough episodes with sufficient length for evaluation.")
 
     world.set_policy(policy)
-
     results_path.mkdir(parents=True, exist_ok=True)
+
+    # --- FIX 3: Magic line to bypass the library bug making CPU tensors ---
+    torch.set_default_device("cuda")
 
     start_time = time.time()
     metrics = world.evaluate(
@@ -158,6 +168,9 @@ def run(cfg: DictConfig):
         video=results_path,
     )
     end_time = time.time()
+    
+    # --- Clean up default device back to CPU just in case ---
+    torch.set_default_device("cpu")
     
     print(metrics)
 
