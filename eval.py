@@ -99,12 +99,8 @@ def run(cfg: DictConfig):
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
         config = swm.PlanConfig(**cfg.plan_config)
-        solver = hydra.utils.instantiate(cfg.solver, model=model)        
-        
-        # --- FIX 2: Explicitly move the solver to the GPU ---
-        if hasattr(solver, "to"):
-            solver = solver.to("cuda")
-            
+        solver = hydra.utils.instantiate(cfg.solver, model=model, device="cuda")
+                    
         policy = swm.policy.WorldModelPolicy(
             solver=solver, 
             config=config, 
