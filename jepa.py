@@ -5,11 +5,12 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
+
 def detach_clone(v):
     return v.detach().clone() if torch.is_tensor(v) else v
 
-class JEPA(nn.Module):
 
+class JEPA(nn.Module):
     def __init__(
         self,
         encoder,
@@ -19,7 +20,6 @@ class JEPA(nn.Module):
         pred_proj=None,
     ):
         super().__init__()
-
         self.encoder = encoder
         self.predictor = predictor
         self.action_encoder = action_encoder
@@ -28,12 +28,12 @@ class JEPA(nn.Module):
 
     def encode(self, info):
         """Encode observations and actions into embeddings.
+
         info: dict with pixels and action keys
         """
-
         pixels = info['pixels'].float()
         b = pixels.size(0)
-        pixels = rearrange(pixels, "b t ... -> (b t) ...") # flatten for encoding
+        pixels = rearrange(pixels, "b t ... -> (b t) ...")  # flatten for encoding
         output = self.encoder(pixels, interpolate_pos_encoding=True)
         pixels_emb = output.last_hidden_state[:, 0]  # cls token
         emb = self.projector(pixels_emb)
@@ -46,6 +46,7 @@ class JEPA(nn.Module):
 
     def predict(self, emb, act_emb):
         """Predict next state embedding
+
         emb: (B, T, D)
         act_emb: (B, T, A_emb)
         """
@@ -60,15 +61,17 @@ class JEPA(nn.Module):
 
     def rollout(self, info, action_sequence, history_size: int = 3):
         """Rollout the model given an initial info dict and action sequence.
+
         pixels: (B, S, T, C, H, W)
         action_sequence: (B, S, T, action_dim)
-         - S is the number of action plan samples
-         - T is the time horizon
+        - S is the number of action plan samples
+        - T is the time horizon
         """
-
         assert "pixels" in info, "pixels not in info_dict"
+
         H = info["pixels"].size(2)
         B, S, T = action_sequence.shape[:3]
+
         act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
         info["action"] = act_0
         n_steps = T - H
@@ -90,6 +93,7 @@ class JEPA(nn.Module):
             act_emb = self.action_encoder(act)
             emb_trunc = emb[:, -HS:]  # (BS, HS, D)
             act_trunc = act_emb[:, -HS:]  # (BS, HS, A_emb)
+
             pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]  # (BS, 1, D)
             emb = torch.cat([emb, pred_emb], dim=1)  # (BS, T+1, D)
 
@@ -113,7 +117,6 @@ class JEPA(nn.Module):
         """Compute the cost between predicted embeddings and goal embeddings."""
         pred_emb = info_dict["predicted_emb"]  # (B,S, T-1, dim)
         goal_emb = info_dict["goal_emb"]  # (B, S, T, dim)
-
         goal_emb = goal_emb[..., -1:, :].expand_as(pred_emb)
 
         # return last-step cost per action candidate
@@ -122,13 +125,12 @@ class JEPA(nn.Module):
             goal_emb[..., -1:, :].detach(),
             reduction="none",
         ).sum(dim=tuple(range(2, pred_emb.ndim)))  # (B, S)
-
         return cost
 
     def get_cost(self, info_dict: dict, action_candidates: torch.Tensor):
-        """ Compute the cost of action candidates given an info dict with goal and initial state."""
-
+        """Compute the cost of action candidates given an info dict with goal and initial state."""
         assert "goal" in info_dict, "goal not in info_dict"
+        info_dict = dict(info_dict)
 
         device = next(self.parameters()).device
         for k in list(info_dict.keys()):
@@ -137,17 +139,13 @@ class JEPA(nn.Module):
 
         goal = {k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)}
         goal["pixels"] = goal["goal"]
-
         for k in info_dict:
             if k.startswith("goal_"):
                 goal[k[len("goal_") :]] = goal.pop(k)
-
         goal.pop("action")
         goal = self.encode(goal)
-
         info_dict["goal_emb"] = goal["emb"]
-        info_dict = self.rollout(info_dict, action_candidates)
 
+        info_dict = self.rollout(info_dict, action_candidates)
         cost = self.criterion(info_dict)
-        
         return cost
