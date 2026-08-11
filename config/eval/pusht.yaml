@@ -19,7 +19,7 @@ seed: 42
 policy: random # ckpt name or random
 
 plan_config:
-  horizon: 25
+  horizon: 5
   receding_horizon: 5
   action_block: 5 # frameskip
 
@@ -27,7 +27,7 @@ plan_config:
 eval:
   num_eval: 50
   goal_offset_steps: 25
-  eval_budget: 50
+  eval_budget: 25
   img_size: 224
   dataset_name: pusht_expert_train
   callables:
