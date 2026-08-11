@@ -154,9 +154,6 @@ def run(cfg: DictConfig):
     world.set_policy(policy)
     results_path.mkdir(parents=True, exist_ok=True)
 
-    # --- FIX 3: Magic line to bypass the library bug making CPU tensors ---
-    torch.set_default_device("cuda")
-
     start_time = time.time()
     metrics = world.evaluate(
         dataset=dataset,
