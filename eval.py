@@ -18,7 +18,11 @@ import stable_worldmodel as swm
 from stable_worldmodel.solver.gd import GradientSolver
 
 # ---------------------------------------------------------------------------
-# PATCH: stable-worldmodel 0.1.1 bug — leave the warm-start action tensor on CPU
+# PATCH: stable-worldmodel 0.1.1 bug — GradientSolver.init_action() /
+# prepare_init_action() leave the warm-start action tensor on CPU on the
+# very first planning call, causing:
+#   RuntimeError: Expected all tensors to be on the same device, but found
+#   at least two devices, cuda:0 and cpu!
 # ---------------------------------------------------------------------------
 def _patched_init_action(self, n_envs, actions=None):
     if actions is None:
@@ -54,82 +58,48 @@ GradientSolver.init_action = _patched_init_action
 
 
 # ---------------------------------------------------------------------------
-# CUSTOM SOLVER: Explicit gradient computation using Sum of Squared Errors
+# CUSTOM SOLVER: Forces Sum of Squared Errors (SSE) instead of MSE 
+# during the gradient descent planning loop.
 # ---------------------------------------------------------------------------
+_orig_mse_loss = F.mse_loss
+_orig_mse_module_init = nn.MSELoss.__init__
+
+def _sse_functional(*args, **kwargs):
+    kwargs["reduction"] = "sum"
+    return _orig_mse_loss(*args, **kwargs)
+
+def _sse_module_init(self, *args, **kwargs):
+    kwargs["reduction"] = "sum"
+    _orig_mse_module_init(self, *args, **kwargs)
+
 class CustomSolver(GradientSolver):
-    def solve(self, obs, goal, *args, **kwargs):
+    def solve(self, data, init_action=None):
         """
-        Custom planning loop that explicitly computes Sum of Squared Errors (SSE)
-        instead of Mean Squared Error (MSE), giving us full control over the loss
-        reduction without relying on the library's internal implementation.
+        Wraps the original solve method. We patch PyTorch's MSE functions
+        to use 'sum' reduction right before calling the library's solve logic,
+        and restore them immediately after.
         """
-        # 1. Determine batch size
-        if isinstance(obs, dict):
-            n_envs = next((v.shape[0] for v in obs.values() if isinstance(v, torch.Tensor)), 1)
-        else:
-            n_envs = obs.shape[0]
-
-        # 2. Initialize actions using the patched init_action
-        self.init_action(n_envs)
-
-        # 3. Extract optimizer parameters from the solver config safely
-        lr = getattr(self, 'lr', None) or getattr(self.config, 'lr', 1e-3)
-        iters = getattr(self, 'iterations', None) or getattr(self.config, 'iterations', 10)
-
-        # 4. Setup Adam optimizer on the action parameter
-        self.init.requires_grad_(True)
-        optimizer = torch.optim.Adam([self.init], lr=lr)
-
-        # 5. Explicit Gradient Descent Loop
-        for i in range(iters):
-            optimizer.zero_grad()
-
-            # Rollout the world model. We try standard 'rollout' method first.
-            # Fallback to step-by-step if the model doesn't have a rollout method.
-            if hasattr(self.model, 'rollout'):
-                pred_states = self.model.rollout(obs, self.init)
-            else:
-                # Manual step-by-step rollout
-                pred_states = []
-                curr_obs = obs
-                for t in range(self.horizon):
-                    curr_obs = self.model(curr_obs, self.init[:, :, t])
-                    pred_states.append(curr_obs)
+        # 1. Patch the global MSE functions
+        F.mse_loss = _sse_functional
+        nn.MSELoss.__init__ = _sse_module_init
+        
+        # 2. Replace any pre-existing nn.MSELoss instances on this solver
+        replaced_modules = {}
+        for attr_name in list(vars(self)):
+            attr = getattr(self, attr_name, None)
+            if isinstance(attr, nn.MSELoss):
+                replaced_modules[attr_name] = attr
+                setattr(self, attr_name, nn.MSELoss(reduction="sum"))
                 
-                # Reformat to match goal structure (dict or tensor)
-                if isinstance(goal, dict):
-                    pred_states = {k: torch.stack([p[k] for p in pred_states], dim=2) for k in goal}
-                else:
-                    pred_states = torch.stack(pred_states, dim=2)
-
-            # 6. Compute Sum of Squared Errors (SSE) Loss manually
-            loss = 0.0
-            if isinstance(pred_states, dict):
-                for k, v in pred_states.items():
-                    if k in goal:
-                        target = goal[k]
-                        # Match dimensions for broadcasting if target lacks horizon/sample dims
-                        while target.ndim < v.ndim:
-                            target = target.unsqueeze(1)
-                        # EXPLICIT SUM, NO MEAN
-                        loss = loss + ((v - target) ** 2).sum()
-            elif isinstance(pred_states, (list, tuple)):
-                for p, g in zip(pred_states, goal):
-                    while g.ndim < p.ndim:
-                        g = g.unsqueeze(1)
-                    loss = loss + ((p - g) ** 2).sum()
-            else:
-                target = goal
-                while target.ndim < pred_states.ndim:
-                    target = target.unsqueeze(1)
-                loss = ((pred_states - target) ** 2).sum()
-
-            # 7. Backpropagate and step
-            loss.backward()
-            optimizer.step()
-
-        # 8. Return the best action sequence (first sample)
-        return self.init[:, 0]
+        try:
+            # 3. Call the original, library-provided solve method
+            return super().solve(data, init_action=init_action)
+        finally:
+            # 4. Restore everything to avoid side effects on future calls
+            F.mse_loss = _orig_mse_loss
+            nn.MSELoss.__init__ = _orig_mse_module_init
+            for attr_name, attr in replaced_modules.items():
+                setattr(self, attr_name, attr)
 # ---------------------------------------------------------------------------
 
 
@@ -223,7 +193,7 @@ def run(cfg: DictConfig):
         # Instantiate the original solver via Hydra to ensure all configs are populated
         solver = hydra.utils.instantiate(cfg.solver, model=model, device="cuda")
         
-        # Swap the class to our CustomSolver so it uses our explicit SSE gradient loop
+        # Swap the class to our CustomSolver so it uses our SSE wrapper
         solver.__class__ = CustomSolver
                     
         policy = swm.policy.WorldModelPolicy(
