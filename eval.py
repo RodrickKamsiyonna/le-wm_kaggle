@@ -8,6 +8,8 @@ import hydra
 import numpy as np
 import stable_pretraining as spt
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
@@ -16,28 +18,7 @@ import stable_worldmodel as swm
 from stable_worldmodel.solver.gd import GradientSolver
 
 # ---------------------------------------------------------------------------
-# PATCH: stable-worldmodel 0.1.1 bug — GradientSolver.init_action() /
-# prepare_init_action() leave the warm-start action tensor on CPU on the
-# very first planning call, causing:
-#   RuntimeError: Expected all tensors to be on the same device, but found
-#   at least two devices, cuda:0 and cpu!
-#
-# Root cause: when solve() is first called, init_action=None. In
-# prepare_init_action() (solver/utils.py), for a non-Actionable model this
-# branch runs:
-#     device = init_action.device if init_action is not None else 'cpu'
-# which hardcodes 'cpu' regardless of the solver's configured device, and
-# returns a full-horizon action tensor on CPU.
-#
-# Back in GradientSolver.init_action() (solver/gd.py), the only line that
-# moves `actions` to self.device is inside `if remaining > 0: ...`. Since
-# the tensor returned above already covers the full horizon, remaining == 0,
-# so that branch — and the device move — is skipped. The CPU actions tensor
-# is then combined in-place with a CUDA tensor from torch.randn(...,
-# device=self.device), which crashes.
-#
-# Fix: same as the original init_action, but always call actions.to(self.device)
-# right before use, not just inside the "remaining > 0" branch.
+# PATCH: stable-worldmodel 0.1.1 bug — leave the warm-start action tensor on CPU
 # ---------------------------------------------------------------------------
 def _patched_init_action(self, n_envs, actions=None):
     if actions is None:
@@ -68,8 +49,87 @@ def _patched_init_action(self, n_envs, actions=None):
             del self._parameters["init"]
         self.register_parameter("init", torch.nn.Parameter(actions))
 
-
 GradientSolver.init_action = _patched_init_action
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# CUSTOM SOLVER: Explicit gradient computation using Sum of Squared Errors
+# ---------------------------------------------------------------------------
+class CustomSolver(GradientSolver):
+    def solve(self, obs, goal, *args, **kwargs):
+        """
+        Custom planning loop that explicitly computes Sum of Squared Errors (SSE)
+        instead of Mean Squared Error (MSE), giving us full control over the loss
+        reduction without relying on the library's internal implementation.
+        """
+        # 1. Determine batch size
+        if isinstance(obs, dict):
+            n_envs = next((v.shape[0] for v in obs.values() if isinstance(v, torch.Tensor)), 1)
+        else:
+            n_envs = obs.shape[0]
+
+        # 2. Initialize actions using the patched init_action
+        self.init_action(n_envs)
+
+        # 3. Extract optimizer parameters from the solver config safely
+        lr = getattr(self, 'lr', None) or getattr(self.config, 'lr', 1e-3)
+        iters = getattr(self, 'iterations', None) or getattr(self.config, 'iterations', 10)
+
+        # 4. Setup Adam optimizer on the action parameter
+        self.init.requires_grad_(True)
+        optimizer = torch.optim.Adam([self.init], lr=lr)
+
+        # 5. Explicit Gradient Descent Loop
+        for i in range(iters):
+            optimizer.zero_grad()
+
+            # Rollout the world model. We try standard 'rollout' method first.
+            # Fallback to step-by-step if the model doesn't have a rollout method.
+            if hasattr(self.model, 'rollout'):
+                pred_states = self.model.rollout(obs, self.init)
+            else:
+                # Manual step-by-step rollout
+                pred_states = []
+                curr_obs = obs
+                for t in range(self.horizon):
+                    curr_obs = self.model(curr_obs, self.init[:, :, t])
+                    pred_states.append(curr_obs)
+                
+                # Reformat to match goal structure (dict or tensor)
+                if isinstance(goal, dict):
+                    pred_states = {k: torch.stack([p[k] for p in pred_states], dim=2) for k in goal}
+                else:
+                    pred_states = torch.stack(pred_states, dim=2)
+
+            # 6. Compute Sum of Squared Errors (SSE) Loss manually
+            loss = 0.0
+            if isinstance(pred_states, dict):
+                for k, v in pred_states.items():
+                    if k in goal:
+                        target = goal[k]
+                        # Match dimensions for broadcasting if target lacks horizon/sample dims
+                        while target.ndim < v.ndim:
+                            target = target.unsqueeze(1)
+                        # EXPLICIT SUM, NO MEAN
+                        loss = loss + ((v - target) ** 2).sum()
+            elif isinstance(pred_states, (list, tuple)):
+                for p, g in zip(pred_states, goal):
+                    while g.ndim < p.ndim:
+                        g = g.unsqueeze(1)
+                    loss = loss + ((p - g) ** 2).sum()
+            else:
+                target = goal
+                while target.ndim < pred_states.ndim:
+                    target = target.unsqueeze(1)
+                loss = ((pred_states - target) ** 2).sum()
+
+            # 7. Backpropagate and step
+            loss.backward()
+            optimizer.step()
+
+        # 8. Return the best action sequence (first sample)
+        return self.init[:, 0]
 # ---------------------------------------------------------------------------
 
 
@@ -159,7 +219,12 @@ def run(cfg: DictConfig):
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
         config = swm.PlanConfig(**cfg.plan_config)
+        
+        # Instantiate the original solver via Hydra to ensure all configs are populated
         solver = hydra.utils.instantiate(cfg.solver, model=model, device="cuda")
+        
+        # Swap the class to our CustomSolver so it uses our explicit SSE gradient loop
+        solver.__class__ = CustomSolver
                     
         policy = swm.policy.WorldModelPolicy(
             solver=solver, 
