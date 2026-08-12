@@ -18,11 +18,7 @@ import stable_worldmodel as swm
 from stable_worldmodel.solver.gd import GradientSolver
 
 # ---------------------------------------------------------------------------
-# PATCH: stable-worldmodel 0.1.1 bug — GradientSolver.init_action() /
-# prepare_init_action() leave the warm-start action tensor on CPU on the
-# very first planning call, causing:
-#   RuntimeError: Expected all tensors to be on the same device, but found
-#   at least two devices, cuda:0 and cpu!
+# PATCH: stable-worldmodel 0.1.1 bug — leave the warm-start action tensor on CPU
 # ---------------------------------------------------------------------------
 def _patched_init_action(self, n_envs, actions=None):
     if actions is None:
@@ -63,25 +59,46 @@ GradientSolver.init_action = _patched_init_action
 # ---------------------------------------------------------------------------
 _orig_mse_loss = F.mse_loss
 _orig_mse_module_init = nn.MSELoss.__init__
+_orig_tensor_mean = torch.Tensor.mean
+_orig_torch_mean = torch.mean
 
 def _sse_functional(*args, **kwargs):
-    kwargs["reduction"] = "sum"
+    # Only override if reduction is 'mean' or not specified.
+    # If the model requests 'none', we leave it alone to prevent shape crashes.
+    if kwargs.get("reduction", "mean") != "none":
+        kwargs["reduction"] = "sum"
     return _orig_mse_loss(*args, **kwargs)
 
 def _sse_module_init(self, *args, **kwargs):
-    kwargs["reduction"] = "sum"
+    if kwargs.get("reduction", "mean") != "none":
+        kwargs["reduction"] = "sum"
     _orig_mse_module_init(self, *args, **kwargs)
+
+def _sum_mean_no_dim(self, *args, **kwargs):
+    # If .mean() is called without dimensions (e.g. to get a scalar loss),
+    # replace it with .sum() to avoid averaging.
+    if not args and not kwargs:
+        return self.sum()
+    return _orig_tensor_mean(self, *args, **kwargs)
+
+def _sum_torch_mean_no_dim(input, *args, **kwargs):
+    # Same patch for the functional torch.mean(tensor) version
+    if not args and not kwargs:
+        return input.sum()
+    return _orig_torch_mean(input, *args, **kwargs)
 
 class CustomSolver(GradientSolver):
     def solve(self, data, init_action=None):
         """
-        Wraps the original solve method. We patch PyTorch's MSE functions
+        Wraps the original solve method. We patch PyTorch's MSE and mean functions
         to use 'sum' reduction right before calling the library's solve logic,
         and restore them immediately after.
         """
-        # 1. Patch the global MSE functions
+        # 1. Patch the global MSE and mean functions
         F.mse_loss = _sse_functional
         nn.MSELoss.__init__ = _sse_module_init
+        torch.Tensor.mean = _sum_mean_no_dim
+        torch.mean = _sum_torch_mean_no_dim
         
         # 2. Replace any pre-existing nn.MSELoss instances on this solver
         replaced_modules = {}
@@ -98,6 +115,8 @@ class CustomSolver(GradientSolver):
             # 4. Restore everything to avoid side effects on future calls
             F.mse_loss = _orig_mse_loss
             nn.MSELoss.__init__ = _orig_mse_module_init
+            torch.Tensor.mean = _orig_tensor_mean
+            torch.mean = _orig_torch_mean
             for attr_name, attr in replaced_modules.items():
                 setattr(self, attr_name, attr)
 # ---------------------------------------------------------------------------
