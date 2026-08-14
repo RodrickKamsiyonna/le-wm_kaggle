@@ -32,30 +32,38 @@ GradientSolver.init_action = _patched_init_action
 
 class DiagramSolver(GradientSolver):
     def __init__(self, model, device="cuda", horizon=5, action_dim=2, lr=0.1, n_iter=50, grad_clip=None, action_noise=0.0, action_bounds=None, action_chunk=5, process=None, **kwargs):
-        # GradientSolver in 0.1.1 does NOT take action_dim in __init__ - it's set via configure/env
-        # Try with model+device only
-        try:
-            super().__init__(model=model, device=device)
-        except TypeError as e:
-            # fallback: model only
-            super().__init__(model=model)
+        # Try multiple signatures for GradientSolver.__init__ (API changed across versions)
+        init_success = False
+        last_err = None
+        # Common kwargs that GradientSolver accepts in different versions
+        candidates = [
+            dict(model=model, n_steps=n_iter, device=device),
+            dict(model=model, n_steps=n_iter, batch_size=1, device=device),
+            dict(model=model, n_steps=n_iter, batch_size=1, num_samples=1, device=device),
+            dict(model=model, n_steps=n_iter, batch_size=1, num_samples=1, action_noise=action_noise, device=device),
+            dict(model=model, n_steps=n_iter, device=device, seed=42),
+            dict(model=model, n_steps=n_iter),
+            dict(model=model, device=device),
+            dict(model=model),
+        ]
+        for kw in candidates:
+            try:
+                super().__init__(**kw)
+                init_success = True
+                print(f"GradientSolver init success with {kw.keys()}")
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if not init_success:
+            raise RuntimeError(f"Could not init GradientSolver, last error: {last_err}")
 
-        # Now set our attrs, handling read-only horizon
+        # Now set horizon / action_dim - may be read-only, so use object.__setattr__
         try:
             self.horizon = horizon
         except AttributeError:
             object.__setattr__(self, "_horizon", int(horizon))
             self.__dict__["_horizon"] = int(horizon)
-
-        # action_dim may be property - try set
-        try:
-            self.action_dim = action_dim
-        except AttributeError:
-            object.__setattr__(self, "_action_dim", int(action_dim))
-            self.__dict__["_action_dim"] = int(action_dim)
-        # ensure attribute exists
-        if not hasattr(self, "_action_dim"):
-            object.__setattr__(self, "_action_dim", int(action_dim))
 
         self.action_chunk = action_chunk
         self.chunk_dim = action_chunk * action_dim
@@ -73,16 +81,15 @@ class DiagramSolver(GradientSolver):
             self.norm_lo = proc.transform(np.array([[raw_lo]*action_dim]))[0,0]
             self.norm_hi = proc.transform(np.array([[raw_hi]*action_dim]))[0,0]
 
-    def configure(self, envs=None, config=None, **kwargs):
+        # Ensure action_dim is set for patched init_action
         try:
-            super().configure(envs, config, **kwargs)
+            if getattr(self, "action_dim", None) != action_dim:
+                try:
+                    self.action_dim = action_dim
+                except AttributeError:
+                    object.__setattr__(self, "_action_dim", int(action_dim))
         except Exception:
-            pass
-        if config is not None and hasattr(config, "horizon"):
-            try:
-                self.horizon = config.horizon
-            except AttributeError:
-                object.__setattr__(self, "_horizon", int(config.horizon))
+            object.__setattr__(self, "_action_dim", int(action_dim))
 
     def solve(self, obs_emb, act_emb, goal_emb):
         B = obs_emb.shape[0]
