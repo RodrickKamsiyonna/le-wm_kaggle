@@ -12,65 +12,46 @@ from torchvision.transforms import v2 as transforms
 import stable_pretraining as spt
 import stable_worldmodel as swm
 
-# PATCH for device bug
-try:
-    from stable_worldmodel.solver.gd import GradientSolver
-    def _patched_init_action(self, n_envs, actions=None):
-        if actions is None:
-            actions = torch.zeros((n_envs, 0, self.action_dim), dtype=self.dtype)
-        remaining = self.horizon - actions.shape[1]
-        if remaining > 0:
-            new_actions = torch.zeros(n_envs, remaining, self.action_dim, dtype=self.dtype)
-            actions = torch.cat([actions, new_actions], dim=1)
-        actions = actions.to(self.device)
-        actions = actions.unsqueeze(1).repeat_interleave(self.num_samples, dim=1)
-        actions[:, 1:] += (
-            torch.randn(actions[:, 1:].shape, generator=self.torch_gen, device=self.device, dtype=self.dtype) * self.var_scale
-        )
-        if hasattr(self, "init") and self.init.shape == actions.shape:
-            self.init.copy_(actions)
-        else:
-            if "init" in self._parameters:
-                del self._parameters["init"]
-            self.register_parameter("init", torch.nn.Parameter(actions))
-    GradientSolver.init_action = _patched_init_action
-    print("Patched GradientSolver.init_action")
-except Exception as e:
-    print(f"Patch skipped: {e}")
+from stable_worldmodel.solver.gd import GradientSolver
+from stable_worldmodel.solver.solver import Solver
 
-def img_transform(cfg):
-    return transforms.Compose([
-        transforms.ToImage(),
-        transforms.ToDtype(torch.float32, scale=True),
-        transforms.Normalize(**spt.data.dataset_stats.ImageNet),
-        transforms.Resize(size=cfg.eval.img_size),
-    ])
+def _patched_init_action(self, n_envs, actions=None):
+    if actions is None:
+        actions = torch.zeros((n_envs, 0, self.action_dim), dtype=self.dtype)
+    remaining = self.horizon - actions.shape[1]
+    if remaining > 0:
+        new_actions = torch.zeros(n_envs, remaining, self.action_dim, dtype=self.dtype)
+        actions = torch.cat([actions, new_actions], dim=1)
+    actions = actions.to(self.device)
+    actions = actions.unsqueeze(1).repeat_interleave(self.num_samples, dim=1)
+    actions[:, 1:] += (
+        torch.randn(actions[:, 1:].shape, generator=self.torch_gen, device=self.device, dtype=self.dtype) * self.var_scale
+    )
+    if hasattr(self, "init") and self.init.shape == actions.shape:
+        self.init.copy_(actions)
+    else:
+        if "init" in self._parameters:
+            del self._parameters["init"]
+        self.register_parameter("init", torch.nn.Parameter(actions))
 
-def get_dataset(cfg, dataset_name):
-    dataset_path = Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
-    return swm.data.HDF5Dataset(dataset_name, keys_to_cache=cfg.dataset.keys_to_cache, cache_dir=dataset_path)
+GradientSolver.init_action = _patched_init_action
+print("Patched GradientSolver.init_action")
 
-def get_episodes_length(dataset, episodes):
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
-    episode_idx = dataset.get_col_data(col_name)
-    step_idx = dataset.get_col_data("step_idx")
-    return np.array([np.max(step_idx[episode_idx == ep_id]) + 1 for ep_id in episodes])
-
-class DiagramSolver(torch.nn.Module):
+class DiagramSolver(Solver):
     def __init__(self, model, device="cuda", horizon=5, action_dim=2, lr=0.1, n_iter=50, grad_clip=None, action_noise=0.0, action_bounds=None, action_chunk=5, process=None, **kwargs):
         super().__init__()
         self.model = model
         self.device = torch.device(device)
         self.horizon = horizon
         self.action_dim = action_dim
+        self.action_chunk = action_chunk
+        self.chunk_dim = action_chunk * action_dim
         self.lr = lr
         self.n_iter = n_iter
         self.grad_clip = grad_clip
         self.action_noise = action_noise
         self.action_bounds = action_bounds
-        self.action_chunk = action_chunk
         self.process = process
-        self.chunk_dim = action_chunk * action_dim
         self.dtype = torch.float32
         self.num_samples = 1
         self.var_scale = 0.0
@@ -85,21 +66,11 @@ class DiagramSolver(torch.nn.Module):
             self.norm_hi = proc.transform(np.array([[raw_hi]*action_dim]))[0,0]
         self.register_parameter("init", torch.nn.Parameter(torch.zeros(1,1,horizon,action_dim)))
     def configure(self, envs=None, config=None, **kwargs):
-        if config is not None:
-            if hasattr(config, "horizon"): self.horizon = config.horizon
-            if hasattr(config, "action_block"): self.action_block = config.action_block
-            if hasattr(config, "receding_horizon"): self.action_block = config.receding_horizon
-        try:
-            if envs is not None:
-                if hasattr(envs, "action_space") and hasattr(envs.action_space, "shape"):
-                    self.action_dim = envs.action_space.shape[-1]
-                elif hasattr(envs, "single_action_space"):
-                    self.action_dim = envs.single_action_space.shape[0]
-        except: pass
+        if config is not None and hasattr(config, "horizon"):
+            self.horizon = config.horizon
         return
     def reset(self, *args, **kwargs): return
     def clear(self, *args, **kwargs): return
-    def to(self, *args, **kwargs): return super().to(*args, **kwargs)
     def init_action(self, n_envs, actions=None):
         if actions is None:
             actions = torch.zeros((n_envs, 0, self.action_dim), dtype=self.dtype, device=self.device)
@@ -151,18 +122,23 @@ class DiagramSolver(torch.nn.Module):
     def plan(self, *args, **kwargs): return self.solve(*args, **kwargs)
     def forward(self, *args, **kwargs): return self.solve(*args, **kwargs)
 
-class DiagramPolicy(swm.policy.WorldModelPolicy):
-    def __init__(self, model, process, transform, plan_cfg, grad_cfg, device):
-        raw_dim = process["action"].mean_.shape[0]
-        solver = DiagramSolver(
-            model=model, device=device, horizon=plan_cfg.horizon, action_dim=raw_dim,
-            lr=grad_cfg.get("lr", 0.1), n_iter=grad_cfg.get("n_iter", 50),
-            grad_clip=grad_cfg.get("grad_clip", None), action_noise=grad_cfg.get("action_noise", 0.0),
-            action_bounds=grad_cfg.get("action_bounds", None), action_chunk=grad_cfg.get("action_chunk", 5),
-            process=process,
-        )
-        super().__init__(solver=solver, config=plan_cfg, process=process, transform=transform)
-        self.diagram_model = model
+def img_transform(cfg):
+    return transforms.Compose([
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True),
+        transforms.Normalize(**spt.data.dataset_stats.ImageNet),
+        transforms.Resize(size=cfg.eval.img_size),
+    ])
+
+def get_episodes_length(dataset, episodes):
+    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
+    episode_idx = dataset.get_col_data(col_name)
+    step_idx = dataset.get_col_data("step_idx")
+    return np.array([np.max(step_idx[episode_idx == ep_id]) + 1 for ep_id in episodes])
+
+def get_dataset(cfg, dataset_name):
+    dataset_path = Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
+    return swm.data.HDF5Dataset(dataset_name, keys_to_cache=cfg.dataset.keys_to_cache, cache_dir=dataset_path)
 
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
@@ -218,7 +194,15 @@ def run(cfg: DictConfig):
         grad_cfg.setdefault("action_chunk", 5)
         print(f"Plan: horizon={plan_cfg.horizon} block={plan_cfg.action_block}")
         print(f"Grad: {grad_cfg}")
-        policy = DiagramPolicy(model=model, process=process, transform=transform, plan_cfg=plan_cfg, grad_cfg=grad_cfg, device=device)
+        solver = DiagramSolver(
+            model=model, device="cuda", horizon=plan_cfg.horizon,
+            action_dim=process["action"].mean_.shape[0],
+            lr=grad_cfg.get("lr", 0.1), n_iter=grad_cfg.get("n_iter", 50),
+            grad_clip=grad_cfg.get("grad_clip"), action_noise=grad_cfg.get("action_noise", 0.0),
+            action_bounds=grad_cfg.get("action_bounds"), action_chunk=grad_cfg.get("action_chunk", 5),
+            process=process,
+        )
+        policy = swm.policy.WorldModelPolicy(solver=solver, config=plan_cfg, process=process, transform=transform)
     episode_len = get_episodes_length(dataset, ep_indices)
     max_start = episode_len - cfg.eval.goal_offset_steps - 1
     max_dict = {ep_id: max_start[i] for i, ep_id in enumerate(ep_indices)}
