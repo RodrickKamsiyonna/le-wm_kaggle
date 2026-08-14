@@ -8,14 +8,14 @@ import time
 from pathlib import Path
 
 import hydra
+import matplotlib.pyplot as plt
 import numpy as np
-import stable_pretraining as spt
-import torch
 from omegaconf import DictConfig
 from sklearn import preprocessing
+import torch
 from torchvision.transforms import v2 as transforms
+import stable_pretraining as spt
 import stable_worldmodel as swm
-import matplotlib.pyplot as plt
 
 
 def img_transform(cfg):
@@ -60,11 +60,11 @@ class SingleInstancePreprocessor:
             if key in self.transform:
                 val_np = np.array(val)
                 # handle image sequences vs single images
-                if val_np.ndim == 4: # T, C, H, W
+                if val_np.ndim == 4:  # T, C, H, W
                     frames = [self.transform[key](val_np[t]) for t in range(val_np.shape[0])]
-                    batch[key] = torch.stack(frames, dim=0).unsqueeze(0) # 1, T, C, H, W
-                else: # C, H, W
-                    batch[key] = self.transform[key](val_np).unsqueeze(0).unsqueeze(0) # 1, 1, C, H, W
+                    batch[key] = torch.stack(frames, dim=0).unsqueeze(0)  # 1, T, C, H, W
+                else:  # C, H, W
+                    batch[key] = self.transform[key](val_np).unsqueeze(0).unsqueeze(0)  # 1, 1, C, H, W
 
             elif key in self.process:
                 # Normalise vector data
@@ -75,9 +75,9 @@ class SingleInstancePreprocessor:
                 if key == "action":
                     # Action encoder expects chunked inputs
                     tiled = t.repeat(1, self.action_chunk)
-                    batch[key] = tiled.unsqueeze(1) # 1, 1, D*chunk
+                    batch[key] = tiled.unsqueeze(1)  # 1, 1, D*chunk
                 else:
-                    batch[key] = t.unsqueeze(1) # 1, 1, D
+                    batch[key] = t.unsqueeze(1)  # 1, 1, D
             else:
                 # Pass through other keys (like step_idx) if needed, adding dimensions
                 if isinstance(val, (np.ndarray, torch.Tensor)):
@@ -102,12 +102,11 @@ def run_optimization_and_plot(
 ):
     """
     Runs the latent planning optimization loop for a single instance
-    and captures MSE loss over iterations.
+    using explicit energy gradient calculation (torch.autograd.grad).
     """
     print("\nPreparing optimization instance...")
     
     # 1. Preprocess and move to device
-    # Context data is expected to have shape (T_context, ...) in the dict values
     proc_context = preprocessor.preprocess(context_data)
     proc_goal = preprocessor.preprocess(goal_data)
     
@@ -116,12 +115,10 @@ def run_optimization_and_plot(
 
     # 2. Encode context and goal
     with torch.no_grad():
-        # Encode historical context
         ctx_output = model.encode(proc_context)
-        ctx_emb = ctx_output["emb"]      # (1, T_ctx, hidden_dim)
-        ctx_act = ctx_output["act_emb"]  # (1, T_ctx, embed_dim)
+        ctx_emb = ctx_output["emb"]        # (1, T_ctx, hidden_dim)
+        ctx_act = ctx_output["act_emb"]    # (1, T_ctx, embed_dim)
 
-        # Encode goal (extract last embedding if sequence)
         goal_output = model.encode(proc_goal)
         goal_emb = goal_output["emb"][:, -1]  # (1, hidden_dim)
 
@@ -144,27 +141,22 @@ def run_optimization_and_plot(
         with torch.no_grad():
             act_seq.clamp_(norm_lo, norm_hi)
 
-    optimizer = torch.optim.Adam([act_seq], lr=grad_cfg.get("lr", 0.05))
-    
-    n_iter = grad_cfg.get("n_iter", 50) # Default to 50 as requested
+    lr = grad_cfg.get("lr", 0.1)
+    n_iter = grad_cfg.get("n_iter", 50)
     mse_history = []
 
-    print(f"Starting optimization for {n_iter} iterations...")
+    print(f"Starting gradient optimization for {n_iter} iterations (lr={lr})...")
     start_time = time.time()
 
     # 4. Optimization Loop
     for i in range(n_iter):
-        optimizer.zero_grad()
-        
-        # --- Latent Rollout (simplified _compute_energy) ---
-        # Encode current action sequence guess
-        act_emb_seq = model.action_encoder(act_seq) # (1, horizon, embed_dim)
+        # Forward Rollout in Latent Space
+        act_emb_seq = model.action_encoder(act_seq)  # (1, horizon, embed_dim)
 
         current_ctx_emb = ctx_emb
         current_ctx_act = ctx_act
         final_pred_emb = None
 
-        # Iterative prediction over horizon
         for t in range(horizon):
             step_act_emb = act_emb_seq[:, t : t + 1]
             # Shift context window: remove oldest, add current action
@@ -174,7 +166,6 @@ def run_optimization_and_plot(
 
             # Predict next state embedding
             pred_out = model.predict(current_ctx_emb, full_act_ctx)
-            # Handle model returning full sequence vs single prediction
             pred_emb = pred_out[:, -1] if pred_out.dim() == 3 else pred_out 
 
             # Update context for next step: remove oldest emb, add predicted emb
@@ -184,32 +175,41 @@ def run_optimization_and_plot(
             current_ctx_act = full_act_ctx
             final_pred_emb = pred_emb
 
-        # --- Compute Loss (MSE in embedding space) ---
-        # (Predicted_final - Goal)^2 summed over latent dimensions
-        # Shape is (1,)
-        mse_loss = (final_pred_emb - goal_emb).pow(2).sum(dim=-1)
+        # --- Compute Energy and Autograd Gradient ---
+        # energy = (pred - target)^2 summed over latent dimensions and batch
+        energy = (final_pred_emb - goal_emb.detach()).pow(2).sum(dim=-1).sum()
         
-        # Record history (detach from graph, move to CPU)
-        mse_history.append(mse_loss.item())
+        # Calculate exact gradient wrt act_seq
+        grad_energy = torch.autograd.grad(
+            energy, 
+            act_seq, 
+            create_graph=False
+        )[0]
 
-        # Backprop
-        mse_loss.backward()
-        
-        # Grad clipping
-        if grad_cfg.get("grad_clip"):
-            torch.nn.utils.clip_grad_norm_([act_seq], grad_cfg.grad_clip)
-            
-        optimizer.step()
+        # Record history
+        mse_history.append(energy.item())
 
-        # Project back to bounds and apply noise (if configured)
+        # Manual Gradient Step (Gradient Descent on Energy)
         with torch.no_grad():
+            # Grad clipping
+            if grad_cfg.get("grad_clip"):
+                grad_norm = grad_energy.norm()
+                if grad_norm > grad_cfg.grad_clip:
+                    grad_energy = grad_energy * (grad_cfg.grad_clip / (grad_norm + 1e-6))
+
+            # Update: act = act - lr * grad_energy
+            act_seq -= lr * grad_energy
+
+            # Add Langevin dynamics noise (if configured)
             if grad_cfg.get("action_noise", 0.0) > 0.0:
-                act_seq.data += grad_cfg.action_noise * torch.randn_like(act_seq)
+                act_seq += grad_cfg.action_noise * torch.randn_like(act_seq)
+
+            # Project back to bounds
             if grad_cfg.get("action_bounds"):
-                act_seq.data.clamp_(norm_lo, norm_hi)
+                act_seq.clamp_(norm_lo, norm_hi)
 
         if (i + 1) % 10 == 0 or i == 0:
-            print(f"  Iteration {i+1:3d}/{n_iter}  MSE: {mse_history[-1]:.6f}")
+            print(f"  Iteration {i+1:3d}/{n_iter}  Energy (MSE): {mse_history[-1]:.6f}")
 
     total_time = time.time() - start_time
     print(f"Optimization finished in {total_time:.2f}s.")
@@ -217,10 +217,9 @@ def run_optimization_and_plot(
     # 5. Plotting
     plt.figure(figsize=(10, 6))
     plt.plot(range(1, n_iter + 1), mse_history, marker='.', linestyle='-', color='b')
-    plt.title(f'Planning Optimization: Predicted vs Goal Embedding MSE\n'
-              f'(Horizon: {horizon})')
+    plt.title(f'Planning Optimization: Energy Minimization\n(Horizon: {horizon})')
     plt.xlabel('Gradient Descent Iteration')
-    plt.ylabel('Mean Squared Error (Summed over Latent Dim)')
+    plt.ylabel('Energy / Latent MSE')
     plt.grid(True, which="both", ls="-", alpha=0.5)
 
     output_filename = "plan_optimization_curve.png"
@@ -247,7 +246,7 @@ def main(cfg: DictConfig):
     model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model = model.to(device)
     model.eval()
-    model.requires_grad_(False) # Weights are frozen
+    model.requires_grad_(False)  # Weights are frozen
     model.interpolate_pos_encoding = True
 
     # 2. Load Dataset & Statistics
@@ -256,7 +255,8 @@ def main(cfg: DictConfig):
     # Build StandardScalers for normalization based on full dataset
     process_meta = {}
     for col in cfg.dataset.keys_to_cache:
-        if col in ["pixels"]: continue # Images handled via torchvision transform
+        if col in ["pixels"]:
+            continue  # Images handled via torchvision transform
         processor = preprocessing.StandardScaler()
         col_data = dataset.get_col_data(col)
         # Remove NaNs for fitting stats
@@ -286,7 +286,7 @@ def main(cfg: DictConfig):
     # Initialize Preprocessor
     transforms_meta = {
         "pixels": img_transform(cfg),
-        "goal":   img_transform(cfg), # typically just standard image transform
+        "goal":   img_transform(cfg),  # typically just standard image transform
     }
     preprocessor = SingleInstancePreprocessor(cfg, process_meta, transforms_meta, action_chunk)
 
@@ -294,60 +294,43 @@ def main(cfg: DictConfig):
     print("\nExtracting sample data from dataset...")
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
     
-    # Heuristic to find a valid start point (similar to eval.py but simpler)
-    # Just take row 0, assume it's a valid start of a trajectory
     sample_idx = 0 
     row_data = dataset.get_row_data(sample_idx)
     ep_id = row_data[col_name]
     start_step_idx = row_data["step_idx"]
 
-    # World model needs history. Extract 'ctx_len' steps leading up to sample_idx
-    # This simplified version assumes sequential storage in HDF5 or padds.
+    # Context history extraction
     indices = np.arange(max(0, sample_idx - ctx_len + 1), sample_idx + 1)
     context_rows = dataset.get_row_data(indices)
-    
     actual_ctx_len = len(indices)
     
-    # Construct context dict. values shape: (T, ...)
     context_data = {}
-    for key in context_rows.keys():  # <-- Changed this line
-        # Skip metadata columns just to be safe
+    for key in context_rows.keys():
         if key in ["episode_idx", "ep_idx", "step_idx"]: 
             continue
             
         data = context_rows[key]
         if actual_ctx_len < ctx_len:
-            # Pad beginning by repeating first frame
             pad_len = ctx_len - actual_ctx_len
             padding = np.repeat(data[0:1], pad_len, axis=0)
             data = np.concatenate([padding, data], axis=0)
         context_data[key] = data
 
-    # Extract Goal. Look ahead 'goal_offset_steps' in the same episode.
+    # Extract Goal
     goal_offset = cfg.eval.goal_offset_steps
-    
-    # Find all rows for this episode
     ep_episode_idx_all = dataset.get_col_data(col_name)
     ep_mask = ep_episode_idx_all == ep_id
     ep_step_idx_all = dataset.get_col_data("step_idx")
     
-    # Find max step in this episode
     max_step_in_ep = np.max(ep_step_idx_all[ep_mask])
-    
     goal_step_idx = min(start_step_idx + goal_offset, max_step_in_ep)
     
-    # Find absolute index of that goal step
     goal_abs_idx_mask = ep_mask & (ep_step_idx_all == goal_step_idx)
     goal_abs_idx = np.nonzero(goal_abs_idx_mask)[0][0]
-    
     goal_row = dataset.get_row_data(goal_abs_idx)
     
-    # Construct Goal dict (WM usually expects visual goals in "pixels" key,
-    # mapping "goal_pixels" or raw goal data to it).
     goal_data = {}
-    # Map visual observation to goal key
     goal_data["pixels"] = goal_row["pixels"] 
-    # WM might also use state goals if available/configured
     if "agent_pos" in goal_row:
         goal_data["agent_pos"] = goal_row["agent_pos"]
 
@@ -359,7 +342,6 @@ def main(cfg: DictConfig):
     plan_config = swm.PlanConfig(**cfg.plan_config)
     grad_config = cfg.get("gradient_solver", {})
     
-    # Force iterations to 50 for the diagram script, overriding config
     grad_config["n_iter"] = 200
 
     run_optimization_and_plot(
