@@ -35,15 +35,32 @@ def _patched_init_action(self, n_envs, actions=None):
         self.register_parameter("init", torch.nn.Parameter(actions))
 
 GradientSolver.init_action = _patched_init_action
-print("Patched GradientSolver.init_action")
 
 class DiagramSolver(Solver):
-    def __init__(self, model, device="cuda", horizon=5, action_dim=2, lr=0.1, n_iter=50, grad_clip=None, action_noise=0.0, action_bounds=None, action_chunk=5, process=None, **kwargs):
+    # Override read-only properties from base Solver with writable versions
+    @property
+    def horizon(self):
+        return getattr(self, "_horizon", 5)
+    @horizon.setter
+    def horizon(self, v):
+        self._horizon = int(v)
+
+    @property
+    def action_dim(self):
+        return getattr(self, "_action_dim", 2)
+    @action_dim.setter
+    def action_dim(self, v):
+        self._action_dim = int(v)
+
+    def __init__(self, model, device="cuda", horizon=5, action_dim=2, lr=0.1, n_iter=50, 
+                 grad_clip=None, action_noise=0.0, action_bounds=None, action_chunk=5, 
+                 process=None, **kwargs):
         super().__init__()
+        # Use private attrs to avoid property setter issues in base class
+        object.__setattr__(self, "_horizon", int(horizon))
+        object.__setattr__(self, "_action_dim", int(action_dim))
         self.model = model
         self.device = torch.device(device)
-        self.horizon = horizon
-        self.action_dim = action_dim
         self.action_chunk = action_chunk
         self.chunk_dim = action_chunk * action_dim
         self.lr = lr
@@ -65,6 +82,7 @@ class DiagramSolver(Solver):
             self.norm_lo = proc.transform(np.array([[raw_lo]*action_dim]))[0,0]
             self.norm_hi = proc.transform(np.array([[raw_hi]*action_dim]))[0,0]
         self.register_parameter("init", torch.nn.Parameter(torch.zeros(1,1,horizon,action_dim)))
+
     def configure(self, envs=None, config=None, **kwargs):
         if config is not None and hasattr(config, "horizon"):
             self.horizon = config.horizon
@@ -143,8 +161,7 @@ def get_dataset(cfg, dataset_name):
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
     assert cfg.plan_config.horizon * cfg.plan_config.action_block <= cfg.eval.eval_budget
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: cuda")
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
     if "num_envs" not in cfg.world: cfg.world.num_envs = 1
     world = swm.World(**cfg.world, image_shape=(224, 224))
@@ -161,48 +178,43 @@ def run(cfg: DictConfig):
         scaler.fit(col_data)
         process[col] = scaler
         if col != "action": process[f"goal_{col}"] = scaler
-    policy_name = cfg.get("policy", "random")
-    if policy_name == "random":
-        policy = swm.policy.RandomPolicy()
-    else:
-        ckpt_path = cfg.policy
-        for cand in [cfg.policy, cfg.policy + "_object.ckpt", cfg.policy + ".ckpt"]:
-            if os.path.exists(cand):
-                ckpt_path = cand
-                break
-        if not os.path.exists(ckpt_path):
-            ckpt_path = cfg.policy + "_object.ckpt"
-        print(f"Loading {ckpt_path}")
-        model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        model = model.to("cuda")
-        model.eval()
-        model.requires_grad_(False)
-        model.interpolate_pos_encoding = True
-        plan_cfg = swm.PlanConfig(**cfg.plan_config)
-        grad_cfg = {}
-        if cfg.get("gradient_solver"):
-            grad_cfg = OmegaConf.to_container(cfg.gradient_solver, resolve=True)
-        elif cfg.get("solver"):
-            s = OmegaConf.to_container(cfg.solver, resolve=True)
-            for k in ["n_iter","lr","grad_clip","action_noise","action_bounds","action_chunk"]:
-                if k in s: grad_cfg[k] = s[k]
-        grad_cfg.setdefault("n_iter", 50)
-        grad_cfg.setdefault("lr", 0.1)
-        grad_cfg.setdefault("grad_clip", None)
-        grad_cfg.setdefault("action_noise", 0.0)
-        grad_cfg.setdefault("action_bounds", None)
-        grad_cfg.setdefault("action_chunk", 5)
-        print(f"Plan: horizon={plan_cfg.horizon} block={plan_cfg.action_block}")
-        print(f"Grad: {grad_cfg}")
-        solver = DiagramSolver(
-            model=model, device="cuda", horizon=plan_cfg.horizon,
-            action_dim=process["action"].mean_.shape[0],
-            lr=grad_cfg.get("lr", 0.1), n_iter=grad_cfg.get("n_iter", 50),
-            grad_clip=grad_cfg.get("grad_clip"), action_noise=grad_cfg.get("action_noise", 0.0),
-            action_bounds=grad_cfg.get("action_bounds"), action_chunk=grad_cfg.get("action_chunk", 5),
-            process=process,
-        )
-        policy = swm.policy.WorldModelPolicy(solver=solver, config=plan_cfg, process=process, transform=transform)
+    ckpt_path = cfg.policy
+    for cand in [cfg.policy, cfg.policy + "_object.ckpt", cfg.policy + ".ckpt"]:
+        if os.path.exists(cand):
+            ckpt_path = cand
+            break
+    if not os.path.exists(ckpt_path):
+        ckpt_path = cfg.policy + "_object.ckpt"
+    print(f"Loading {ckpt_path}")
+    model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model = model.to("cuda")
+    model.eval()
+    model.requires_grad_(False)
+    model.interpolate_pos_encoding = True
+    plan_cfg = swm.PlanConfig(**cfg.plan_config)
+    grad_cfg = {}
+    if cfg.get("gradient_solver"):
+        grad_cfg = OmegaConf.to_container(cfg.gradient_solver, resolve=True)
+    elif cfg.get("solver"):
+        s = OmegaConf.to_container(cfg.solver, resolve=True)
+        for k in ["n_iter","lr","grad_clip","action_noise","action_bounds","action_chunk"]:
+            if k in s: grad_cfg[k] = s[k]
+    grad_cfg.setdefault("n_iter", 50)
+    grad_cfg.setdefault("lr", 0.1)
+    grad_cfg.setdefault("grad_clip", None)
+    grad_cfg.setdefault("action_noise", 0.0)
+    grad_cfg.setdefault("action_bounds", None)
+    grad_cfg.setdefault("action_chunk", 5)
+    print(f"Plan: horizon={plan_cfg.horizon} block={plan_cfg.action_block} Grad: {grad_cfg}")
+    solver = DiagramSolver(
+        model=model, device="cuda", horizon=plan_cfg.horizon,
+        action_dim=process["action"].mean_.shape[0],
+        lr=grad_cfg.get("lr", 0.1), n_iter=grad_cfg.get("n_iter", 50),
+        grad_clip=grad_cfg.get("grad_clip"), action_noise=grad_cfg.get("action_noise", 0.0),
+        action_bounds=grad_cfg.get("action_bounds"), action_chunk=grad_cfg.get("action_chunk", 5),
+        process=process,
+    )
+    policy = swm.policy.WorldModelPolicy(solver=solver, config=plan_cfg, process=process, transform=transform)
     episode_len = get_episodes_length(dataset, ep_indices)
     max_start = episode_len - cfg.eval.goal_offset_steps - 1
     max_dict = {ep_id: max_start[i] for i, ep_id in enumerate(ep_indices)}
@@ -215,7 +227,7 @@ def run(cfg: DictConfig):
     sampled = np.sort(valid_indices[sampled])
     eval_eps = dataset.get_row_data(sampled)[col_name]
     eval_starts = dataset.get_row_data(sampled)["step_idx"]
-    results_path = Path(swm.data.utils.get_cache_dir(), cfg.policy).parent if cfg.policy != "random" else Path(__file__).parent
+    results_path = Path(swm.data.utils.get_cache_dir(), cfg.policy).parent
     results_path.mkdir(parents=True, exist_ok=True)
     world.set_policy(policy)
     start = time.time()
@@ -230,10 +242,7 @@ def run(cfg: DictConfig):
     )
     print(metrics)
     with (results_path / cfg.output.filename).open("a") as f:
-        f.write("\n==== CONFIG ====\n")
-        f.write(OmegaConf.to_yaml(cfg))
-        f.write(f"\nmetrics: {metrics}\n")
-        f.write(f"time: {time.time()-start}\n")
+        f.write(f"\nmetrics: {metrics}\ntime: {time.time()-start}\n")
 
 if __name__ == "__main__":
     run()
