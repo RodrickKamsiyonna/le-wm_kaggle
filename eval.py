@@ -32,9 +32,6 @@ GradientSolver.init_action = _patched_init_action
 
 class DiagramSolver(GradientSolver):
     def __init__(self, model, device="cuda", horizon=5, action_dim=2, lr=0.1, n_iter=50, grad_clip=None, action_noise=0.0, action_bounds=None, action_chunk=5, process=None, **kwargs):
-        # Try multiple signatures
-        init_success = False
-        last_err = None
         candidates = [
             dict(model=model, n_steps=n_iter, device=device),
             dict(model=model, n_steps=n_iter, batch_size=1, device=device),
@@ -43,18 +40,18 @@ class DiagramSolver(GradientSolver):
             dict(model=model, device=device),
             dict(model=model),
         ]
+        init_success = False
+        last_err = None
         for kw in candidates:
             try:
                 super().__init__(**kw)
                 init_success = True
-                print(f"GradientSolver init success with {list(kw.keys())}")
                 break
             except Exception as e:
                 last_err = e
                 continue
         if not init_success:
             raise RuntimeError(f"Could not init GradientSolver: {last_err}")
-
         try:
             self.horizon = horizon
         except AttributeError:
@@ -83,64 +80,37 @@ class DiagramSolver(GradientSolver):
         except Exception:
             object.__setattr__(self, "_action_dim", int(action_dim))
 
-    # Accept init_action kwarg - this is what WorldModelPolicy passes
     def solve(self, *args, init_action=None, **kwargs):
-        # Case 1: called as solve(obs_emb, act_emb, goal_emb, init_action=...)
+        # Official solver returns dict with 'actions' key
+        # Handle both signatures: (obs_emb, act_emb, goal_emb) and (obs_dict)
         if len(args) == 3 and all(isinstance(a, torch.Tensor) for a in args):
             obs_emb, act_emb, goal_emb = args
-            return self._solve_from_emb(obs_emb, act_emb, goal_emb, init_action)
-
-        # Case 2: called as solve(observations_dict, init_action=...)
-        if len(args) >= 1 and isinstance(args[0], dict):
-            obs_dict = args[0]
-            # obs_dict may contain pre-encoded embeddings or raw observations
-            # Try to extract embeddings if present
-            if "obs_emb" in obs_dict and "act_emb" in obs_dict and "goal_emb" in obs_dict:
-                return self._solve_from_emb(obs_dict["obs_emb"], obs_dict["act_emb"], obs_dict["goal_emb"], init_action)
-            # If dict contains tensors directly, try to use them
-            # Fallback: if observations contain 'observations' key with embeddings, use that
-            # For compatibility, if we can't parse, try to use init_action as warm start and return it if available
-            # Otherwise, return zeros
-            # We attempt to handle the case where WorldModelPolicy passes encoded batch
-            # The batch may be under 'pixels' etc. - we will encode using model if possible
-            try:
-                # Try to get context from model if obs_dict has raw pixels
-                # This is a best-effort: if obs_dict has 'pixels' tensor, encode it
-                if "pixels" in obs_dict and hasattr(self.model, "encode"):
-                    # obs_dict['pixels'] shape (B, T, C, H, W) or similar
-                    # Use model to encode - fallback to our exact logic using available embeddings
-                    pass
-            except Exception:
-                pass
-            # If init_action is provided and has correct shape, use it as base and optimize from it
-            # For now, if we can't parse embeddings, return init_action if given, else zeros
-            if init_action is not None:
-                # init_action shape: (B, H, D) or (B, H*D)
-                # Return it directly - will be refined in next call? But we want to run our GD
-                # If init_action is tensor, we can use it as starting point for our GD if we had embeddings
-                # Since we don't have embeddings, return init_action as is (warm start)
-                if isinstance(init_action, torch.Tensor):
-                    return init_action
-            # Fallback zero action
-            # Infer batch size from obs_dict
-            b_size = 1
-            try:
-                # try to infer from any tensor in dict
-                for v in obs_dict.values():
-                    if isinstance(v, torch.Tensor):
-                        b_size = v.shape[0]
-                        break
-                    if isinstance(v, (list, np.ndarray)) and len(v) > 0:
-                        b_size = len(v)
-                        break
-            except Exception:
+            actions_tensor = self._solve_from_emb(obs_emb, act_emb, goal_emb, init_action)
+        else:
+            # Fallback - if dict passed, try to get embeddings or return init_action
+            if init_action is not None and isinstance(init_action, torch.Tensor):
+                actions_tensor = init_action
+                # If init_action is (B, H, D) already, use it; if (B, num_samples, H, D) take first sample
+                if actions_tensor.dim() == 4:
+                    actions_tensor = actions_tensor[:, 0]
+            else:
+                # Infer batch size
                 b_size = 1
-            return torch.zeros(b_size, self.horizon, self.action_dim, device=self.device, dtype=torch.float32)
+                if len(args) >= 1 and isinstance(args[0], dict):
+                    for v in args[0].values():
+                        if isinstance(v, torch.Tensor):
+                            b_size = v.shape[0]
+                            break
+                actions_tensor = torch.zeros(b_size, self.horizon, self.action_dim, device=self.device)
 
-        # Fallback for unexpected signature
-        if init_action is not None and isinstance(init_action, torch.Tensor):
-            return init_action
-        return torch.zeros(1, self.horizon, self.action_dim, device=self.device)
+        # Return dict as expected by WorldModelPolicy: {'actions': (B, H, D) or (B, 1, H, D)}
+        # Policy does outputs['actions'] and then indexes, so we return (B, H, D) and let it handle
+        # To match GradientSolver return format, return dict with 'actions' and 'init_action'
+        return {
+            "actions": actions_tensor,  # (B, H, D) normalized
+            "init_action": actions_tensor,
+            "energy": torch.zeros(actions_tensor.shape[0], device=self.device),
+        }
 
     def _solve_from_emb(self, obs_emb, act_emb, goal_emb, init_action=None):
         B = obs_emb.shape[0]
@@ -151,18 +121,14 @@ class DiagramSolver(GradientSolver):
             ctx_act = act_emb[b:b+1]
             g_emb = goal_emb[b:b+1]
 
-            # Use init_action as warm start if provided and shape matches
             if init_action is not None and isinstance(init_action, torch.Tensor):
-                # init_action may be (B, H, D) normalized
                 try:
                     warm = init_action[b]
-                    # warm shape H,D -> need to expand to H, chunk_dim
-                    # Create act_seq from warm: repeat or tile
+                    if warm.dim() == 3:  # (num_samples, H, D) -> take first
+                        warm = warm[0]
                     act_seq_init = torch.zeros(1, self.horizon, self.chunk_dim, device=device)
-                    # Fill first action_dim with warm
-                    if warm.dim() == 2:  # H,D
+                    if warm.dim() == 2:
                         act_seq_init[0, :, :self.action_dim] = warm
-                        # Tile to chunk if needed
                         for i in range(1, self.action_chunk):
                             act_seq_init[0, :, i*self.action_dim:(i+1)*self.action_dim] = warm
                     act_seq = act_seq_init.clone().detach().requires_grad_(True)
