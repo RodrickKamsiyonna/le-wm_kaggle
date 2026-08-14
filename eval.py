@@ -62,16 +62,6 @@ def get_dataset(cfg, dataset_name):
 # It still plugs into WorldModelPolicy (implements the `Solver` protocol:
 # configure/.horizon/.action_dim/.n_envs/solve()) so the receding-horizon,
 # warm-start, and per-env replanning bookkeeping isn't reimplemented here.
-#
-# ASSUMPTION FLAGGED: the live env only ever exposes a single current frame
-# per replan call (no history_len stacking is wired up anywhere in
-# stable_worldmodel 0.1.1 — WorldModelPolicy/GradientSolver both only ever
-# saw a single timestep too, so this matches what was already working).
-# Since there's no real multi-frame history available, the context window
-# fed to model.encode() is warm-started by repeating the current frame
-# across `history_size` slots with a zero action context. If your model's
-# encode()/predict() expect something else here (e.g. it maintains its own
-# internal recurrent state), swap out `_encode_context` accordingly.
 # ---------------------------------------------------------------------------
 class ManualGradSolver:
     """Hand-written gradient-descent action solver (no stable_worldmodel solver classes)."""
@@ -103,9 +93,8 @@ class ManualGradSolver:
         except (AttributeError, StopIteration):
             self.dtype = torch.float32
 
-        # same lookup diagram.py uses for the model's required context window
+        # context window lookup
         self.history_size = getattr(model, "history_size", 1)
-
         self._configured = False
 
     def configure(self, *, action_space, n_envs, config):
@@ -121,8 +110,6 @@ class ManualGradSolver:
 
     @property
     def action_dim(self):
-        # raw action dim * action_block (frameskip chunking), same convention
-        # GradientSolver used, so WorldModelPolicy's reshape logic still works
         return self._raw_action_dim * self._config.action_block
 
     @property
@@ -132,20 +119,34 @@ class ManualGradSolver:
     def __call__(self, *args, **kwargs):
         return self.solve(*args, **kwargs)
 
+    def _prepare_frame_tensor(self, frame, transform_fn):
+        t_frame = transform_fn(frame)
+        if not isinstance(t_frame, torch.Tensor):
+            t_frame = torch.as_tensor(t_frame)
+        # Guarantee 3D shape: (C, H, W)
+        while t_frame.dim() > 3:
+            t_frame = t_frame.squeeze(0)
+        return t_frame
+
     def _encode_context(self, pixels):
         """pixels: (n_envs, H, W, C) single current frame -> encoded context window."""
+        t_fn = self.transform["pixels"]
         frames = torch.stack(
-            [self.transform["pixels"](p) for p in pixels], dim=0
+            [self._prepare_frame_tensor(p, t_fn) for p in pixels], dim=0
         ).to(self.device, dtype=self.dtype)  # (n_envs, C, H, W)
 
-        # warm-start the context window by repeating the current frame
+        # warm-start context window by repeating the current frame: (n_envs, history_size, C, H, W)
         batch = {"pixels": frames.unsqueeze(1).repeat(1, self.history_size, 1, 1, 1)}
 
+        num_envs = pixels.shape[0] if hasattr(pixels, "shape") else len(pixels)
         if "action" in self.process:
             act_dim = self.process["action"].mean_.shape[0] * self._config.action_block
             batch["action"] = torch.zeros(
-                pixels.shape[0], self.history_size, act_dim,
-                device=self.device, dtype=self.dtype,
+                num_envs,
+                self.history_size,
+                act_dim,
+                device=self.device,
+                dtype=self.dtype,
             )
 
         with torch.no_grad():
@@ -153,14 +154,17 @@ class ManualGradSolver:
         return out["emb"], out["act_emb"]  # (n_envs, history_size, hidden_dim), (n_envs, history_size, embed_dim)
 
     def _encode_goal(self, goal_pixels):
+        t_fn = self.transform["goal"]
         frames = torch.stack(
-            [self.transform["goal"](p) for p in goal_pixels], dim=0
-        ).to(self.device, dtype=self.dtype)
-        batch = {"pixels": frames.unsqueeze(1)}  # single frame, T=1
+            [self._prepare_frame_tensor(p, t_fn) for p in goal_pixels], dim=0
+        ).to(self.device, dtype=self.dtype)  # (n_envs, C, H, W)
+
+        batch = {"pixels": frames.unsqueeze(1)}  # (n_envs, 1, C, H, W)
+        num_envs = goal_pixels.shape[0] if hasattr(goal_pixels, "shape") else len(goal_pixels)
         if "action" in self.process:
             act_dim = self.process["action"].mean_.shape[0] * self._config.action_block
             batch["action"] = torch.zeros(
-                goal_pixels.shape[0], 1, act_dim, device=self.device, dtype=self.dtype
+                num_envs, 1, act_dim, device=self.device, dtype=self.dtype
             )
         with torch.no_grad():
             out = self.model.encode(batch)
@@ -218,7 +222,7 @@ class ManualGradSolver:
 
             # sum over latent dim, NOT mean — per-env MSE, shape (n_envs,)
             mse_loss = (final_pred_emb - goal_emb).pow(2).sum(dim=-1)
-            cost = mse_loss.sum()  # sum across envs to get one scalar to backprop; grads stay per-env since the batch dim never mixes
+            cost = mse_loss.sum()  # sum across envs to get one scalar to backprop
             cost.backward()
 
             if self.grad_clip is not None:
@@ -260,7 +264,7 @@ def run(cfg: DictConfig):
     }
 
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
-    stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
+    stats_dataset = dataset
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
     ep_indices, _ = np.unique(stats_dataset.get_col_data(col_name), return_index=True)
 
@@ -278,19 +282,16 @@ def run(cfg: DictConfig):
             process[f"goal_{col}"] = process[col]
 
     # -- run evaluation
-    policy = cfg.get("policy", "random")
+    policy_name = cfg.get("policy", "random")
 
-    if policy != "random":
-
+    if policy_name != "random":
         ckpt_path = cfg.policy
         if not ckpt_path.endswith(".ckpt"):
-            ckpt_path += ".ckpt"  # Ensure it looks for a .ckpt file
+            ckpt_path += ".ckpt"
 
         print(f"Loading local PyTorch model from {ckpt_path}...")
         model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-
         model = model.to("cuda")
-
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
@@ -321,7 +322,7 @@ def run(cfg: DictConfig):
 
     results_path = (
         Path(swm.data.utils.get_cache_dir(), cfg.policy).parent
-        if cfg.policy != "random"
+        if policy_name != "random"
         else Path(__file__).parent
     )
 
@@ -329,13 +330,11 @@ def run(cfg: DictConfig):
     episode_len = get_episodes_length(dataset, ep_indices)
     max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
     max_start_idx_dict = {ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)}
-    # Map each dataset row's episode_idx to its max_start_idx
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
+    
     max_start_per_row = np.array(
         [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
     )
 
-    # remove all the lines of dataset for which dataset['step_idx'] > max_start_per_row
     valid_mask = dataset.get_col_data("step_idx") <= max_start_per_row
     valid_indices = np.nonzero(valid_mask)[0]
     print(valid_mask.sum(), "valid starting points found for evaluation.")
@@ -344,8 +343,6 @@ def run(cfg: DictConfig):
     random_episode_indices = g.choice(
         len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False
     )
-
-    # sort increasingly to avoid issues with HDF5Dataset indexing
     random_episode_indices = np.sort(valid_indices[random_episode_indices])
 
     print(random_episode_indices)
@@ -377,12 +374,10 @@ def run(cfg: DictConfig):
     results_path.parent.mkdir(parents=True, exist_ok=True)
 
     with results_path.open("a") as f:
-        f.write("\n")  # separate from previous runs
-
+        f.write("\n")
         f.write("==== CONFIG ====\n")
         f.write(OmegaConf.to_yaml(cfg))
         f.write("\n")
-
         f.write("==== RESULTS ====\n")
         f.write(f"metrics: {metrics}\n")
         f.write(f"evaluation_time: {end_time - start_time} seconds\n")
