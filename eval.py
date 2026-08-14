@@ -32,14 +32,31 @@ GradientSolver.init_action = _patched_init_action
 
 class DiagramSolver(GradientSolver):
     def __init__(self, model, device="cuda", horizon=5, action_dim=2, lr=0.1, n_iter=50, grad_clip=None, action_noise=0.0, action_bounds=None, action_chunk=5, process=None, **kwargs):
+        # GradientSolver in 0.1.1 does NOT take action_dim in __init__ - it's set via configure/env
+        # Try with model+device only
         try:
-            super().__init__(model=model, device=device, action_dim=action_dim, **kwargs)
-        except TypeError:
-            super().__init__(model=model, device=device, action_dim=action_dim)
+            super().__init__(model=model, device=device)
+        except TypeError as e:
+            # fallback: model only
+            super().__init__(model=model)
+
+        # Now set our attrs, handling read-only horizon
         try:
             self.horizon = horizon
         except AttributeError:
             object.__setattr__(self, "_horizon", int(horizon))
+            self.__dict__["_horizon"] = int(horizon)
+
+        # action_dim may be property - try set
+        try:
+            self.action_dim = action_dim
+        except AttributeError:
+            object.__setattr__(self, "_action_dim", int(action_dim))
+            self.__dict__["_action_dim"] = int(action_dim)
+        # ensure attribute exists
+        if not hasattr(self, "_action_dim"):
+            object.__setattr__(self, "_action_dim", int(action_dim))
+
         self.action_chunk = action_chunk
         self.chunk_dim = action_chunk * action_dim
         self.lr = lr
@@ -55,6 +72,18 @@ class DiagramSolver(GradientSolver):
             proc = process["action"]
             self.norm_lo = proc.transform(np.array([[raw_lo]*action_dim]))[0,0]
             self.norm_hi = proc.transform(np.array([[raw_hi]*action_dim]))[0,0]
+
+    def configure(self, envs=None, config=None, **kwargs):
+        try:
+            super().configure(envs, config, **kwargs)
+        except Exception:
+            pass
+        if config is not None and hasattr(config, "horizon"):
+            try:
+                self.horizon = config.horizon
+            except AttributeError:
+                object.__setattr__(self, "_horizon", int(config.horizon))
+
     def solve(self, obs_emb, act_emb, goal_emb):
         B = obs_emb.shape[0]
         device = self.device
