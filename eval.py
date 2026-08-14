@@ -8,118 +8,11 @@ import hydra
 import numpy as np
 import stable_pretraining as spt
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
-
-from stable_worldmodel.solver.gd import GradientSolver
-
-# ---------------------------------------------------------------------------
-# PATCH: stable-worldmodel 0.1.1 bug — leave the warm-start action tensor on CPU
-# ---------------------------------------------------------------------------
-def _patched_init_action(self, n_envs, actions=None):
-    if actions is None:
-        actions = torch.zeros((n_envs, 0, self.action_dim), dtype=self.dtype)
-
-    remaining = self.horizon - actions.shape[1]
-    if remaining > 0:
-        new_actions = torch.zeros(n_envs, remaining, self.action_dim, dtype=self.dtype)
-        actions = torch.cat([actions, new_actions], dim=1)
-
-    actions = actions.to(self.device)  # <-- always move, not just when padding was needed
-
-    actions = actions.unsqueeze(1).repeat_interleave(self.num_samples, dim=1)
-    actions[:, 1:] += (
-        torch.randn(
-            actions[:, 1:].shape,
-            generator=self.torch_gen,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        * self.var_scale
-    )
-
-    if hasattr(self, "init") and self.init.shape == actions.shape:
-        self.init.copy_(actions)
-    else:
-        if "init" in self._parameters:
-            del self._parameters["init"]
-        self.register_parameter("init", torch.nn.Parameter(actions))
-
-GradientSolver.init_action = _patched_init_action
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# CUSTOM SOLVER: Forces Sum of Squared Errors (SSE) instead of MSE 
-# during the gradient descent planning loop.
-# ---------------------------------------------------------------------------
-_orig_mse_loss = F.mse_loss
-_orig_mse_module_init = nn.MSELoss.__init__
-_orig_tensor_mean = torch.Tensor.mean
-_orig_torch_mean = torch.mean
-
-def _sse_functional(*args, **kwargs):
-    # Only override if reduction is 'mean' or not specified.
-    # If the model requests 'none', we leave it alone to prevent shape crashes.
-    if kwargs.get("reduction", "mean") != "none":
-        kwargs["reduction"] = "sum"
-    return _orig_mse_loss(*args, **kwargs)
-
-def _sse_module_init(self, *args, **kwargs):
-    if kwargs.get("reduction", "mean") != "none":
-        kwargs["reduction"] = "sum"
-    _orig_mse_module_init(self, *args, **kwargs)
-
-def _sum_mean_no_dim(self, *args, **kwargs):
-    # If .mean() is called without dimensions (e.g. to get a scalar loss),
-    # replace it with .sum() to avoid averaging.
-    if not args and not kwargs:
-        return self.sum()
-    return _orig_tensor_mean(self, *args, **kwargs)
-
-def _sum_torch_mean_no_dim(input, *args, **kwargs):
-    # Same patch for the functional torch.mean(tensor) version
-    if not args and not kwargs:
-        return input.sum()
-    return _orig_torch_mean(input, *args, **kwargs)
-
-class CustomSolver(GradientSolver):
-    def solve(self, data, init_action=None):
-        """
-        Wraps the original solve method. We patch PyTorch's MSE and mean functions
-        to use 'sum' reduction right before calling the library's solve logic,
-        and restore them immediately after.
-        """
-        # 1. Patch the global MSE and mean functions
-        F.mse_loss = _sse_functional
-        nn.MSELoss.__init__ = _sse_module_init
-        torch.Tensor.mean = _sum_mean_no_dim
-        torch.mean = _sum_torch_mean_no_dim
-        
-        # 2. Replace any pre-existing nn.MSELoss instances on this solver
-        replaced_modules = {}
-        for attr_name in list(vars(self)):
-            attr = getattr(self, attr_name, None)
-            if isinstance(attr, nn.MSELoss):
-                replaced_modules[attr_name] = attr
-                setattr(self, attr_name, nn.MSELoss(reduction="sum"))
-                
-        try:
-            # 3. Call the original, library-provided solve method
-            return super().solve(data, init_action=init_action)
-        finally:
-            # 4. Restore everything to avoid side effects on future calls
-            F.mse_loss = _orig_mse_loss
-            nn.MSELoss.__init__ = _orig_mse_module_init
-            torch.Tensor.mean = _orig_tensor_mean
-            torch.mean = _orig_torch_mean
-            for attr_name, attr in replaced_modules.items():
-                setattr(self, attr_name, attr)
-# ---------------------------------------------------------------------------
+from stable_worldmodel.policy import PlanConfig, WorldModelPolicy
 
 
 def img_transform(cfg):
@@ -153,6 +46,201 @@ def get_dataset(cfg, dataset_name):
         cache_dir=dataset_path,
     )
     return dataset
+
+
+# ---------------------------------------------------------------------------
+# ManualGradSolver
+#
+# Replaces stable_worldmodel.solver.gd.GradientSolver entirely. No
+# torch.optim object of any kind is used — every action update is
+# `act_seq.data -= lr * act_seq.grad`, computed via a plain .backward() call.
+# The rollout mechanics (encode -> iterative model.predict over the horizon
+# -> MSE-to-goal loss) are copied straight from diagram.py's
+# run_optimization_and_plot(), just batched over n_envs instead of a single
+# instance, and the loss is (pred - goal).pow(2).sum(dim=-1) — NOT .mean().
+#
+# It still plugs into WorldModelPolicy (implements the `Solver` protocol:
+# configure/.horizon/.action_dim/.n_envs/solve()) so the receding-horizon,
+# warm-start, and per-env replanning bookkeeping isn't reimplemented here.
+#
+# ASSUMPTION FLAGGED: the live env only ever exposes a single current frame
+# per replan call (no history_len stacking is wired up anywhere in
+# stable_worldmodel 0.1.1 — WorldModelPolicy/GradientSolver both only ever
+# saw a single timestep too, so this matches what was already working).
+# Since there's no real multi-frame history available, the context window
+# fed to model.encode() is warm-started by repeating the current frame
+# across `history_size` slots with a zero action context. If your model's
+# encode()/predict() expect something else here (e.g. it maintains its own
+# internal recurrent state), swap out `_encode_context` accordingly.
+# ---------------------------------------------------------------------------
+class ManualGradSolver:
+    """Hand-written gradient-descent action solver (no stable_worldmodel solver classes)."""
+
+    def __init__(
+        self,
+        model,
+        process,
+        transform,
+        n_steps=50,
+        lr=0.05,
+        grad_clip=None,
+        action_bounds=None,
+        action_noise=0.0,
+        device="cuda",
+    ):
+        self.model = model
+        self.process = process
+        self.transform = transform
+        self.n_steps = n_steps
+        self.lr = lr
+        self.grad_clip = grad_clip
+        self.action_bounds = action_bounds
+        self.action_noise = action_noise
+        self.device = torch.device(device)
+
+        try:
+            self.dtype = next(model.parameters()).dtype
+        except (AttributeError, StopIteration):
+            self.dtype = torch.float32
+
+        # same lookup diagram.py uses for the model's required context window
+        self.history_size = getattr(model, "history_size", 1)
+
+        self._configured = False
+
+    def configure(self, *, action_space, n_envs, config):
+        self._action_space = action_space
+        self._n_envs = n_envs
+        self._config = config
+        self._raw_action_dim = int(np.prod(action_space.shape[1:]))
+        self._configured = True
+
+    @property
+    def n_envs(self):
+        return self._n_envs
+
+    @property
+    def action_dim(self):
+        # raw action dim * action_block (frameskip chunking), same convention
+        # GradientSolver used, so WorldModelPolicy's reshape logic still works
+        return self._raw_action_dim * self._config.action_block
+
+    @property
+    def horizon(self):
+        return self._config.horizon
+
+    def __call__(self, *args, **kwargs):
+        return self.solve(*args, **kwargs)
+
+    def _encode_context(self, pixels):
+        """pixels: (n_envs, H, W, C) single current frame -> encoded context window."""
+        frames = torch.stack(
+            [self.transform["pixels"](p) for p in pixels], dim=0
+        ).to(self.device, dtype=self.dtype)  # (n_envs, C, H, W)
+
+        # warm-start the context window by repeating the current frame
+        batch = {"pixels": frames.unsqueeze(1).repeat(1, self.history_size, 1, 1, 1)}
+
+        if "action" in self.process:
+            act_dim = self.process["action"].mean_.shape[0] * self._config.action_block
+            batch["action"] = torch.zeros(
+                pixels.shape[0], self.history_size, act_dim,
+                device=self.device, dtype=self.dtype,
+            )
+
+        with torch.no_grad():
+            out = self.model.encode(batch)
+        return out["emb"], out["act_emb"]  # (n_envs, history_size, hidden_dim), (n_envs, history_size, embed_dim)
+
+    def _encode_goal(self, goal_pixels):
+        frames = torch.stack(
+            [self.transform["goal"](p) for p in goal_pixels], dim=0
+        ).to(self.device, dtype=self.dtype)
+        batch = {"pixels": frames.unsqueeze(1)}  # single frame, T=1
+        if "action" in self.process:
+            act_dim = self.process["action"].mean_.shape[0] * self._config.action_block
+            batch["action"] = torch.zeros(
+                goal_pixels.shape[0], 1, act_dim, device=self.device, dtype=self.dtype
+            )
+        with torch.no_grad():
+            out = self.model.encode(batch)
+        return out["emb"][:, -1]  # (n_envs, hidden_dim)
+
+    def solve(self, info_dict, init_action=None):
+        n_envs = len(info_dict["pixels"])
+
+        ctx_emb, ctx_act = self._encode_context(info_dict["pixels"])
+        goal_emb = self._encode_goal(info_dict["goal"])
+
+        # --- init action sequence, padding a shorter warm-started plan up to horizon ---
+        if init_action is not None:
+            init_action = init_action.to(self.device, dtype=self.dtype)
+            remaining = self.horizon - init_action.shape[1]
+            if remaining > 0:
+                pad = torch.zeros(
+                    n_envs, remaining, self.action_dim, device=self.device, dtype=self.dtype
+                )
+                init_action = torch.cat([init_action, pad], dim=1)
+            act_seq = init_action.clone().detach()
+        else:
+            act_seq = torch.randn(
+                n_envs, self.horizon, self.action_dim, device=self.device, dtype=self.dtype
+            )
+
+        if self.action_bounds and "action" in self.process:
+            raw_lo, raw_hi = self.action_bounds
+            proc = self.process["action"]
+            norm_lo = proc.transform(np.array([[raw_lo] * self._raw_action_dim]))[0, 0]
+            norm_hi = proc.transform(np.array([[raw_hi] * self._raw_action_dim]))[0, 0]
+            act_seq.clamp_(norm_lo, norm_hi)
+
+        act_seq.requires_grad_(True)
+        cost_history = []
+
+        # --- Raw gradient descent: cost.backward() + act_seq.grad, no torch.optim ---
+        for step in range(self.n_steps):
+            if act_seq.grad is not None:
+                act_seq.grad = None
+
+            act_emb_seq = self.model.action_encoder(act_seq)  # (n_envs, horizon, embed_dim)
+
+            current_ctx_emb, current_ctx_act = ctx_emb, ctx_act
+            final_pred_emb = None
+
+            for t in range(self.horizon):
+                step_act_emb = act_emb_seq[:, t : t + 1]
+                full_act_ctx = torch.cat([current_ctx_act[:, 1:], step_act_emb], dim=1)
+                pred_out = self.model.predict(current_ctx_emb, full_act_ctx)
+                pred_emb = pred_out[:, -1] if pred_out.dim() == 3 else pred_out
+                current_ctx_emb = torch.cat([current_ctx_emb[:, 1:], pred_emb.unsqueeze(1)], dim=1)
+                current_ctx_act = full_act_ctx
+                final_pred_emb = pred_emb
+
+            # sum over latent dim, NOT mean — per-env MSE, shape (n_envs,)
+            mse_loss = (final_pred_emb - goal_emb).pow(2).sum(dim=-1)
+            cost = mse_loss.sum()  # sum across envs to get one scalar to backprop; grads stay per-env since the batch dim never mixes
+            cost.backward()
+
+            if self.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_([act_seq], self.grad_clip)
+
+            with torch.no_grad():
+                act_seq -= self.lr * act_seq.grad
+                if self.action_noise > 0.0:
+                    act_seq += self.action_noise * torch.randn_like(act_seq)
+                if self.action_bounds and "action" in self.process:
+                    act_seq.clamp_(norm_lo, norm_hi)
+
+            cost_history.append(mse_loss.detach().cpu())
+
+            if (step + 1) % 10 == 0 or step == 0:
+                print(f"    [solve] step {step+1:3d}/{self.n_steps}  mean MSE: {mse_loss.mean().item():.6f}")
+
+        return {
+            "actions": act_seq.detach().cpu(),
+            "cost": torch.stack(cost_history, dim=1),  # (n_envs, n_steps)
+        }
+
 
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
@@ -193,32 +281,39 @@ def run(cfg: DictConfig):
     policy = cfg.get("policy", "random")
 
     if policy != "random":
-        
-        ckpt_path = cfg.policy 
+
+        ckpt_path = cfg.policy
         if not ckpt_path.endswith(".ckpt"):
             ckpt_path += ".ckpt"  # Ensure it looks for a .ckpt file
-            
+
         print(f"Loading local PyTorch model from {ckpt_path}...")
-        model = torch.load(ckpt_path, map_location="cpu", weights_only=False)        
-        
-        # --- FIX 1: Explicitly move the model to the GPU ---
+        model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
         model = model.to("cuda")
-        
+
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
+
         config = swm.PlanConfig(**cfg.plan_config)
-        
-        # Instantiate the original solver via Hydra to ensure all configs are populated
-        solver = hydra.utils.instantiate(cfg.solver, model=model, device="cuda")
-        
-        # Swap the class to our CustomSolver so it uses our SSE wrapper
-        solver.__class__ = CustomSolver
-                    
-        policy = swm.policy.WorldModelPolicy(
-            solver=solver, 
-            config=config, 
-            process=process, 
+
+        grad_cfg = cfg.get("gradient_solver", {})
+        solver = ManualGradSolver(
+            model=model,
+            process=process,
+            transform=transform,
+            n_steps=grad_cfg.get("n_iter", 50),
+            lr=grad_cfg.get("lr", 0.05),
+            grad_clip=grad_cfg.get("grad_clip"),
+            action_bounds=grad_cfg.get("action_bounds"),
+            action_noise=grad_cfg.get("action_noise", 0.0),
+            device="cuda",
+        )
+
+        policy = WorldModelPolicy(
+            solver=solver,
+            config=config,
+            process=process,
             transform=transform,
         )
     else:
@@ -234,7 +329,7 @@ def run(cfg: DictConfig):
     episode_len = get_episodes_length(dataset, ep_indices)
     max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
     max_start_idx_dict = {ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)}
-    # Map each dataset row’s episode_idx to its max_start_idx
+    # Map each dataset row's episode_idx to its max_start_idx
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
     max_start_per_row = np.array(
         [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
@@ -275,7 +370,7 @@ def run(cfg: DictConfig):
         video=results_path,
     )
     end_time = time.time()
-        
+
     print(metrics)
 
     results_path = results_path / cfg.output.filename
