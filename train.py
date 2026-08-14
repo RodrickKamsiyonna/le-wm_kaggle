@@ -1,359 +1,325 @@
 import os
-
-# Set EGL for rendering if the model needs to render images internally, 
-# though for pure latent planning this might not be strictly necessary.
-os.environ["MUJOCO_GL"] = "egl"
-
-import time
+from functools import partial
 from pathlib import Path
 
 import hydra
-import matplotlib.pyplot as plt
-import numpy as np
-from omegaconf import DictConfig
-from sklearn import preprocessing
-import torch
-from torchvision.transforms import v2 as transforms
+import lightning as pl
 import stable_pretraining as spt
 import stable_worldmodel as swm
+import torch
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import WandbLogger
+from omegaconf import OmegaConf, open_dict
+
+from jepa import JEPA
+from module import ARPredictor, Embedder, MLP, SIGReg
+from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
 
 
-def img_transform(cfg):
-    """Standard image preprocessing."""
-    transform = transforms.Compose(
-        [
-            transforms.ToImage(),
-            transforms.ToDtype(torch.float32, scale=True),
-            transforms.Normalize(**spt.data.dataset_stats.ImageNet),
-            transforms.Resize(size=cfg.eval.img_size),
-        ]
+# ─────────────────────────────────────────────────────────────────────────────
+# Resumable DataLoader
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ResumableDataLoader(torch.utils.data.DataLoader):
+    """DataLoader that supports state_dict / load_state_dict for mid-epoch resume.
+
+    On checkpoint save, Lightning calls state_dict() and stores the number of
+    batches already consumed this epoch.  On resume, load_state_dict() restores
+    that count and __iter__ silently skips those batches so training picks up
+    exactly where it left off.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._start_idx = 0  # batches already consumed this epoch
+
+    # ── checkpoint interface ──────────────────────────────────────────────────
+    def state_dict(self):
+        return {"start_idx": self._start_idx}
+
+    def load_state_dict(self, state: dict):
+        self._start_idx = state.get("start_idx", 0)
+
+    # ── skip already-seen batches on resume ───────────────────────────────────
+    def __iter__(self):
+        iterator = super().__iter__()
+        for i, batch in enumerate(iterator):
+            if i < self._start_idx:
+                continue          # fast-forward past consumed batches
+            self._start_idx = 0  # clear after the first yielded batch
+            yield batch
+        self._start_idx = 0       # full epoch done — reset for next epoch
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Forward passes
+# ─────────────────────────────────────────────────────────────────────────────
+
+def lejepa_forward1(self, batch, stage, cfg):
+    """Encode observations, predict next states, compute losses (baseline)."""
+
+    ctx_len = cfg.wm.history_size
+    n_preds = cfg.wm.num_preds
+    lambd = cfg.loss.sigreg.weight
+
+    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+
+    output = self.model.encode(batch)
+
+    emb = output["emb"]
+    act_emb = output["act_emb"]
+
+    ctx_emb = emb[:, :ctx_len]
+    ctx_act = act_emb[:, :ctx_len]
+
+    tgt_emb = emb[:, n_preds:]
+    pred_emb = self.model.predict(ctx_emb, ctx_act)
+
+    output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
+    output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+
+    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    return output
+
+
+def lejepa_forward(self, batch, stage, cfg):
+    """Encode observations, predict next states, compute losses with EQM."""
+
+    ctx_len = cfg.wm.history_size
+    n_preds = cfg.wm.num_preds
+    lambd = cfg.loss.sigreg.weight
+    eqm_lambda = cfg.loss.get("eqm_lambda", 1.0)
+    eqm_weight = cfg.loss.get("eqm_pred_weight", 0.5)
+
+    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+    output = self.model.encode(batch)
+
+    emb = output["emb"]
+    act_emb = output["act_emb"]
+
+    ctx_emb = emb[:, :ctx_len]
+    ctx_act = act_emb[:, :ctx_len]
+    tgt_emb = emb[:, n_preds:]
+
+    pred_emb_std = self.model.predict(ctx_emb, ctx_act)
+    output["pred_loss"] = (pred_emb_std - tgt_emb).pow(2).mean()
+
+    ctx_actions_raw = batch["action"][:, :ctx_len]
+    B = ctx_actions_raw.shape[0]
+
+    with torch.enable_grad():
+        gamma = torch.rand(B, 1, 1, device=ctx_actions_raw.device, dtype=ctx_actions_raw.dtype)
+        eps = torch.randn_like(ctx_actions_raw)
+
+        act_gamma = (
+            gamma * ctx_actions_raw.detach() + (1 - gamma) * eps
+        ).requires_grad_(True)                          # (B, ctx_len, act_dim)
+
+        pred_emb_noisy = self.model.predict(
+            ctx_emb.detach(),
+            self.model.action_encoder(act_gamma),
+        )
+
+        # detach tgt_emb: target only, no cross-stream grad-fn kept alive
+        energy = (pred_emb_noisy - tgt_emb.detach()).pow(2).sum(dim=-1).sum()
+
+        grad_energy = torch.autograd.grad(energy, act_gamma, create_graph=True)[0]
+
+        target_grad = (eps - ctx_actions_raw.detach()) * eqm_lambda * (1 - gamma)
+
+    output["pred_loss_eqm"] = (grad_energy - target_grad).pow(2).mean()
+    output["energy"] = energy.detach()
+    output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))
+
+    output["loss"] = (
+        output["pred_loss"]
+        + eqm_weight * output["pred_loss_eqm"]
+        + lambd * output["sigreg_loss"]
     )
-    return transform
+
+    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+    losses_dict[f"{stage}/energy"] = output["energy"]
+    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    return output
 
 
-def get_dataset(cfg, dataset_name):
-    """Loads the HDF5 dataset."""
-    dataset_path = Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
-    dataset = swm.data.HDF5Dataset(
-        dataset_name,
-        keys_to_cache=cfg.dataset.keys_to_cache,
-        cache_dir=dataset_path,
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_latest_checkpoint(run_dir: Path, model_name: str):
+    """Find the latest step checkpoint for auto-resume."""
+    ckpts = list(run_dir.glob(f"{model_name}_step*.ckpt"))
+    if not ckpts:
+        return None
+
+    def extract_step(p):
+        try:
+            return int(str(p.stem).split("step=")[-1])
+        except Exception:
+            return -1
+
+    latest = max(ckpts, key=extract_step)
+    print(f"Auto-resuming from: {latest}")
+    return latest
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+@hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
+def run(cfg):
+
+    # ── dataset ───────────────────────────────────────────────────────────────
+    dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
+    transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)]
+
+    with open_dict(cfg):
+        for col in cfg.data.dataset.keys_to_load:
+            if col.startswith("pixels"):
+                continue
+            normalizer = get_column_normalizer(dataset, col, col)
+            transforms.append(normalizer)
+            setattr(cfg.wm, f"{col}_dim", dataset.get_dim(col))
+
+    transform = spt.data.transforms.Compose(*transforms)
+    dataset.transform = transform
+
+    rnd_gen = torch.Generator().manual_seed(cfg.seed)
+    train_set, val_set = spt.data.random_split(
+        dataset,
+        lengths=[cfg.train_split, 1 - cfg.train_split],
+        generator=rnd_gen,
     )
-    return dataset
 
-
-class SingleInstancePreprocessor:
-    """
-    Handles normalisation and transform for a single data instance
-    to prepare it for the World Model.
-    """
-    def __init__(self, config, process: dict, transform: dict, action_chunk: int):
-        self.config = config
-        self.process = process
-        self.transform = transform
-        self.action_chunk = action_chunk
-
-    def preprocess(self, obs: dict) -> dict:
-        """Preprocess single obs dict into tensors with leading (B=1, T=1) dims."""
-        batch = {}
-        for key, val in obs.items():
-            if key in self.transform:
-                val_np = np.array(val)
-                # handle image sequences vs single images
-                if val_np.ndim == 4:  # T, C, H, W
-                    frames = [self.transform[key](val_np[t]) for t in range(val_np.shape[0])]
-                    batch[key] = torch.stack(frames, dim=0).unsqueeze(0)  # 1, T, C, H, W
-                else:  # C, H, W
-                    batch[key] = self.transform[key](val_np).unsqueeze(0).unsqueeze(0)  # 1, 1, C, H, W
-
-            elif key in self.process:
-                # Normalise vector data
-                arr = np.array(val, dtype=np.float32).reshape(1, -1)
-                transformed = self.process[key].transform(arr)
-                t = torch.tensor(transformed, dtype=torch.float32)
-                
-                if key == "action":
-                    # Action encoder expects chunked inputs
-                    tiled = t.repeat(1, self.action_chunk)
-                    batch[key] = tiled.unsqueeze(1)  # 1, 1, D*chunk
-                else:
-                    batch[key] = t.unsqueeze(1)  # 1, 1, D
-            else:
-                # Pass through other keys (like step_idx) if needed, adding dimensions
-                if isinstance(val, (np.ndarray, torch.Tensor)):
-                    t = torch.as_tensor(val, dtype=torch.float32)
-                    # Add B, T dims based on heuristic
-                    while t.ndim < 2:
-                        t = t.unsqueeze(0)
-                    batch[key] = t
-                else:
-                    continue
-        return batch
-
-
-def run_optimization_and_plot(
-    model, 
-    preprocessor, 
-    context_data, 
-    goal_data, 
-    plan_cfg, 
-    grad_cfg, 
-    device
-):
-    """
-    Runs the latent planning optimization loop for a single instance
-    using explicit energy gradient calculation (torch.autograd.grad).
-    """
-    print("\nPreparing optimization instance...")
-    
-    # 1. Preprocess and move to device
-    proc_context = preprocessor.preprocess(context_data)
-    proc_goal = preprocessor.preprocess(goal_data)
-    
-    proc_context = {k: v.to(device) for k, v in proc_context.items()}
-    proc_goal = {k: v.to(device) for k, v in proc_goal.items()}
-
-    # 2. Encode context and goal
-    with torch.no_grad():
-        ctx_output = model.encode(proc_context)
-        ctx_emb = ctx_output["emb"]        # (1, T_ctx, hidden_dim)
-        ctx_act = ctx_output["act_emb"]    # (1, T_ctx, embed_dim)
-
-        goal_output = model.encode(proc_goal)
-        goal_emb = goal_output["emb"][:, -1]  # (1, hidden_dim)
-
-    # 3. Setup Optimization variables
-    horizon = plan_cfg.horizon
-    action_dim = preprocessor.process["action"].mean_.shape[0]
-    chunk_dim = preprocessor.action_chunk * action_dim
-    
-    # Initialize random action sequence (B=1)
-    act_seq = torch.randn(
-        1, horizon, chunk_dim, device=device, requires_grad=True
+    # ResumableDataLoader — supports state_dict / load_state_dict so Lightning
+    # can skip already-consumed batches when resuming a mid-epoch checkpoint.
+    train = ResumableDataLoader(
+        train_set, **cfg.loader, shuffle=True, drop_last=True, generator=rnd_gen
     )
-    
-    # Apply bounds if configured
-    if grad_cfg.get("action_bounds") and "action" in preprocessor.process:
-        raw_lo, raw_hi = grad_cfg.action_bounds
-        proc = preprocessor.process["action"]
-        norm_lo = proc.transform(np.array([[raw_lo] * action_dim]))[0, 0]
-        norm_hi = proc.transform(np.array([[raw_hi] * action_dim]))[0, 0]
-        with torch.no_grad():
-            act_seq.clamp_(norm_lo, norm_hi)
+    val = ResumableDataLoader(
+        val_set, **cfg.loader, shuffle=False, drop_last=False
+    )
 
-    lr = grad_cfg.get("lr", 0.05)
-    n_iter = grad_cfg.get("n_iter", 50)
-    mse_history = []
+    # ── model / optimiser ─────────────────────────────────────────────────────
+    encoder = spt.backbone.utils.vit_hf(
+        cfg.encoder_scale,
+        patch_size=cfg.patch_size,
+        image_size=cfg.img_size,
+        pretrained=False,
+        use_mask_token=False,
+    )
 
-    print(f"Starting gradient optimization for {n_iter} iterations (lr={lr})...")
-    start_time = time.time()
+    hidden_dim = encoder.config.hidden_size
+    embed_dim = cfg.wm.get("embed_dim", hidden_dim)
+    effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
 
-    # 4. Optimization Loop
-    for i in range(n_iter):
-        # Forward Rollout in Latent Space
-        act_emb_seq = model.action_encoder(act_seq)  # (1, horizon, embed_dim)
+    predictor = ARPredictor(
+        num_frames=cfg.wm.history_size,
+        input_dim=embed_dim,
+        hidden_dim=hidden_dim,
+        output_dim=hidden_dim,
+        **cfg.predictor,
+    )
 
-        current_ctx_emb = ctx_emb
-        current_ctx_act = ctx_act
-        final_pred_emb = None
+    action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
 
-        for t in range(horizon):
-            step_act_emb = act_emb_seq[:, t : t + 1]
-            # Shift context window: remove oldest, add current action
-            full_act_ctx = torch.cat(
-                [current_ctx_act[:, 1:], step_act_emb], dim=1
-            )
+    projector = MLP(
+        input_dim=hidden_dim,
+        output_dim=embed_dim,
+        hidden_dim=2048,
+        norm_fn=torch.nn.BatchNorm1d,
+    )
 
-            # Predict next state embedding
-            pred_out = model.predict(current_ctx_emb, full_act_ctx)
-            pred_emb = pred_out[:, -1] if pred_out.dim() == 3 else pred_out 
+    predictor_proj = MLP(
+        input_dim=hidden_dim,
+        output_dim=embed_dim,
+        hidden_dim=2048,
+        norm_fn=torch.nn.BatchNorm1d,
+    )
 
-            # Update context for next step: remove oldest emb, add predicted emb
-            current_ctx_emb = torch.cat(
-                [current_ctx_emb[:, 1:], pred_emb.unsqueeze(1)], dim=1
-            )
-            current_ctx_act = full_act_ctx
-            final_pred_emb = pred_emb
+    world_model = JEPA(
+        encoder=encoder,
+        predictor=predictor,
+        action_encoder=action_encoder,
+        projector=projector,
+        pred_proj=predictor_proj,
+    )
 
-        # --- Compute Energy and Autograd Gradient ---
-        # energy = (pred - target)^2 summed over latent dimensions and batch
-        energy = (final_pred_emb - goal_emb.detach()).pow(2).sum(dim=-1).sum()
-        
-        # Calculate exact gradient wrt act_seq
-        grad_energy = torch.autograd.grad(
-            energy, 
-            act_seq, 
-            create_graph=False
-        )[0]
+    steps_per_epoch = len(train)
+    total_steps = cfg.trainer.max_epochs * steps_per_epoch
+    warmup_steps = int(0.03 * total_steps)
 
-        # Record history
-        mse_history.append(energy.item())
-
-        # Manual Gradient Step (Gradient Descent on Energy)
-        with torch.no_grad():
-            # Grad clipping
-            if grad_cfg.get("grad_clip"):
-                grad_norm = grad_energy.norm()
-                if grad_norm > grad_cfg.grad_clip:
-                    grad_energy = grad_energy * (grad_cfg.grad_clip / (grad_norm + 1e-6))
-
-            # Update: act = act - lr * grad_energy
-            act_seq -= lr * grad_energy
-
-            # Add Langevin dynamics noise (if configured)
-            if grad_cfg.get("action_noise", 0.0) > 0.0:
-                act_seq += grad_cfg.action_noise * torch.randn_like(act_seq)
-
-            # Project back to bounds
-            if grad_cfg.get("action_bounds"):
-                act_seq.clamp_(norm_lo, norm_hi)
-
-        if (i + 1) % 10 == 0 or i == 0:
-            print(f"  Iteration {i+1:3d}/{n_iter}  Energy (MSE): {mse_history[-1]:.6f}")
-
-    total_time = time.time() - start_time
-    print(f"Optimization finished in {total_time:.2f}s.")
-
-    # 5. Plotting
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, n_iter + 1), mse_history, marker='.', linestyle='-', color='b')
-    plt.title(f'Planning Optimization: Energy Minimization\n(Horizon: {horizon})')
-    plt.xlabel('Gradient Descent Iteration')
-    plt.ylabel('Energy / Latent MSE')
-    plt.grid(True, which="both", ls="-", alpha=0.5)
-
-    output_filename = "plan_optimization_curve.png"
-    plt.savefig(output_filename, dpi=150)
-    print(f"\nPlot saved to: {output_filename}")
-    plt.show()
-
-
-@hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
-def main(cfg: DictConfig):
-    # Setup device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # 1. Load Model
-    policy_name = cfg.get("policy", "random")
-    if policy_name == "random":
-        raise ValueError("Cannot run gradient optimization visualization for 'random' policy. "
-                         "Please specify a trained policy in config (e.g., +policy=jepa).")
-        
-    ckpt_path = cfg.policy + "_object.ckpt"
-    print(f"Loading model object from {ckpt_path}...")
-    # Load weights_only=False because we are loading the whole object, not just state_dict
-    model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    model = model.to(device)
-    model.eval()
-    model.requires_grad_(False)  # Weights are frozen
-    model.interpolate_pos_encoding = True
-
-    # 2. Load Dataset & Statistics
-    dataset = get_dataset(cfg, cfg.eval.dataset_name)
-    
-    # Build StandardScalers for normalization based on full dataset
-    process_meta = {}
-    for col in cfg.dataset.keys_to_cache:
-        if col in ["pixels"]:
-            continue  # Images handled via torchvision transform
-        processor = preprocessing.StandardScaler()
-        col_data = dataset.get_col_data(col)
-        # Remove NaNs for fitting stats
-        col_data = col_data[~np.isnan(col_data).any(axis=1)]
-        processor.fit(col_data)
-        process_meta[col] = processor
-
-    # 3. Determine Model Hyperparameters (Context length, chunking)
-    raw_action_dim = process_meta["action"].mean_.shape[0]
-    
-    # Determine Action Chunk Size
-    if hasattr(cfg, "wm") and hasattr(cfg.wm, "action_chunk"):
-        action_chunk = cfg.wm.action_chunk
-    elif hasattr(model, "action_encoder") and hasattr(model.action_encoder, "in_features"):
-        action_chunk = model.action_encoder.in_features // raw_action_dim
-    else:
-        action_chunk = cfg.get("gradient_solver", {}).get("action_chunk", 5)
-
-    # Determine Context Length
-    if hasattr(cfg, "wm") and hasattr(cfg.wm, "history_size"):
-        ctx_len = cfg.wm.history_size
-    elif hasattr(cfg, "model") and hasattr(cfg.model, "history_size"):
-        ctx_len = cfg.model.history_size
-    else:
-        ctx_len = getattr(model, "history_size", 1)
-
-    # Initialize Preprocessor
-    transforms_meta = {
-        "pixels": img_transform(cfg),
-        "goal":   img_transform(cfg),  # typically just standard image transform
+    optimizers = {
+        "model_opt": {
+            "modules": "model",
+            "optimizer": dict(cfg.optimizer),
+            "scheduler": {
+                "type": "LinearWarmupCosineAnnealingLR",
+                "warmup_steps": warmup_steps,
+                "max_steps": total_steps,
+            },
+            "interval": "step",
+        },
     }
-    preprocessor = SingleInstancePreprocessor(cfg, process_meta, transforms_meta, action_chunk)
 
-    # 4. Extract ONE valid sample instance from dataset
-    print("\nExtracting sample data from dataset...")
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
-    
-    sample_idx = 0 
-    row_data = dataset.get_row_data(sample_idx)
-    ep_id = row_data[col_name]
-    start_step_idx = row_data["step_idx"]
-
-    # Context history extraction
-    indices = np.arange(max(0, sample_idx - ctx_len + 1), sample_idx + 1)
-    context_rows = dataset.get_row_data(indices)
-    actual_ctx_len = len(indices)
-    
-    context_data = {}
-    for key in context_rows.keys():
-        if key in ["episode_idx", "ep_idx", "step_idx"]: 
-            continue
-            
-        data = context_rows[key]
-        if actual_ctx_len < ctx_len:
-            pad_len = ctx_len - actual_ctx_len
-            padding = np.repeat(data[0:1], pad_len, axis=0)
-            data = np.concatenate([padding, data], axis=0)
-        context_data[key] = data
-
-    # Extract Goal
-    goal_offset = cfg.eval.goal_offset_steps
-    ep_episode_idx_all = dataset.get_col_data(col_name)
-    ep_mask = ep_episode_idx_all == ep_id
-    ep_step_idx_all = dataset.get_col_data("step_idx")
-    
-    max_step_in_ep = np.max(ep_step_idx_all[ep_mask])
-    goal_step_idx = min(start_step_idx + goal_offset, max_step_in_ep)
-    
-    goal_abs_idx_mask = ep_mask & (ep_step_idx_all == goal_step_idx)
-    goal_abs_idx = np.nonzero(goal_abs_idx_mask)[0][0]
-    goal_row = dataset.get_row_data(goal_abs_idx)
-    
-    goal_data = {}
-    goal_data["pixels"] = goal_row["pixels"] 
-    if "agent_pos" in goal_row:
-        goal_data["agent_pos"] = goal_row["agent_pos"]
-
-    print(f"Successfully extracted instance from Ep {ep_id}. "
-          f"Start Step: {start_step_idx}, Goal Step: {goal_step_idx} "
-          f"(Offset: {goal_step_idx - start_step_idx})")
-
-    # 5. Run Optimization and Generate Plot
-    plan_config = swm.PlanConfig(**cfg.plan_config)
-    grad_config = cfg.get("gradient_solver", {})
-    
-    grad_config["n_iter"] = 200
-
-    run_optimization_and_plot(
-        model,
-        preprocessor,
-        context_data,
-        goal_data,
-        plan_config,
-        grad_config,
-        device
+    data_module = spt.data.DataModule(train=train, val=val)
+    world_model = spt.Module(
+        model=world_model,
+        sigreg=SIGReg(**cfg.loss.sigreg.kwargs),
+        forward=partial(lejepa_forward, cfg=cfg),
+        optim=optimizers,
     )
+
+    # ── training ──────────────────────────────────────────────────────────────
+    run_dir = Path("/kaggle/working", cfg.get("subdir") or "lewm_run")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(run_dir / "config.yaml", "w") as f:
+        OmegaConf.save(cfg, f)
+
+    logger = None
+    if cfg.wandb.enabled:
+        logger = WandbLogger(**cfg.wandb.config)
+        logger.log_hyperparams(OmegaConf.to_container(cfg))
+
+    step_checkpoint = ModelCheckpoint(
+        dirpath=run_dir,
+        filename=f"{cfg.output_model_name}_step{{step}}",
+        every_n_train_steps=500,
+        save_top_k=1,       # only keep the latest to save disk space
+        save_last=False,
+    )
+
+    object_dump_callback = ModelObjectCallBack(
+        dirpath=run_dir,
+        filename=cfg.output_model_name,
+        epoch_interval=1,
+    )
+
+    trainer = pl.Trainer(
+        **cfg.trainer,
+        callbacks=[step_checkpoint, object_dump_callback],
+        num_sanity_val_steps=1,
+        logger=logger,
+        enable_checkpointing=True,
+    )
+
+    # Auto-resume from latest step checkpoint if one exists
+    latest_ckpt = get_latest_checkpoint(run_dir, cfg.output_model_name)
+
+    manager = spt.Manager(
+        trainer=trainer,
+        module=world_model,
+        data=data_module,
+        ckpt_path=latest_ckpt,  # None → fresh run; path → mid-epoch resume
+    )
+
+    manager()
 
 
 if __name__ == "__main__":
-    main()
+    run()
