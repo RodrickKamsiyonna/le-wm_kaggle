@@ -31,7 +31,7 @@ def _patched_init_action(self, n_envs, actions=None):
 GradientSolver.init_action = _patched_init_action
 
 class DiagramSolver(GradientSolver):
-    def __init__(self, model, device="cuda", horizon=5, action_dim=2, lr=0.1, n_iter=50, grad_clip=None, action_noise=0.0, action_bounds=None, action_chunk=5, process=None, **kwargs):
+    def __init__(self, model, device="cuda", horizon=5, action_dim=2, lr=0.5, n_iter=100, grad_clip=10.0, action_noise=0.0, action_bounds=None, action_chunk=5, process=None, **kwargs):
         candidates = [
             dict(model=model, n_steps=n_iter, device=device),
             dict(model=model, n_steps=n_iter, batch_size=1, device=device),
@@ -62,15 +62,26 @@ class DiagramSolver(GradientSolver):
         self.n_iter = n_iter
         self.grad_clip = grad_clip
         self.action_noise = action_noise
-        self.action_bounds = action_bounds
+        self.action_bounds = action_bounds if action_bounds is not None else (-1.0, 1.0)
         self.process = process
         self.norm_lo = None
         self.norm_hi = None
-        if action_bounds and process and "action" in process:
-            raw_lo, raw_hi = action_bounds
+        if self.action_bounds and process and "action" in process:
+            raw_lo, raw_hi = self.action_bounds
             proc = process["action"]
-            self.norm_lo = proc.transform(np.array([[raw_lo]*action_dim]))[0,0]
-            self.norm_hi = proc.transform(np.array([[raw_hi]*action_dim]))[0,0]
+            try:
+                self.norm_lo = proc.transform(np.array([[raw_lo]*action_dim]))[0,0]
+                self.norm_hi = proc.transform(np.array([[raw_hi]*action_dim]))[0,0]
+                print(f"Action bounds raw {self.action_bounds} -> norm [{self.norm_lo:.3f}, {self.norm_hi:.3f}]")
+            except Exception as e:
+                print(f"Could not compute norm bounds: {e}")
+                self.norm_lo = -3.0
+                self.norm_hi = 3.0
+        else:
+            # Default clamp to 3 sigma if no bounds provided
+            self.norm_lo = -3.0
+            self.norm_hi = 3.0
+
         try:
             if getattr(self, "action_dim", None) != action_dim:
                 try:
@@ -81,20 +92,15 @@ class DiagramSolver(GradientSolver):
             object.__setattr__(self, "_action_dim", int(action_dim))
 
     def solve(self, *args, init_action=None, **kwargs):
-        # Official solver returns dict with 'actions' key
-        # Handle both signatures: (obs_emb, act_emb, goal_emb) and (obs_dict)
         if len(args) == 3 and all(isinstance(a, torch.Tensor) for a in args):
             obs_emb, act_emb, goal_emb = args
             actions_tensor = self._solve_from_emb(obs_emb, act_emb, goal_emb, init_action)
         else:
-            # Fallback - if dict passed, try to get embeddings or return init_action
             if init_action is not None and isinstance(init_action, torch.Tensor):
                 actions_tensor = init_action
-                # If init_action is (B, H, D) already, use it; if (B, num_samples, H, D) take first sample
                 if actions_tensor.dim() == 4:
                     actions_tensor = actions_tensor[:, 0]
             else:
-                # Infer batch size
                 b_size = 1
                 if len(args) >= 1 and isinstance(args[0], dict):
                     for v in args[0].values():
@@ -102,12 +108,8 @@ class DiagramSolver(GradientSolver):
                             b_size = v.shape[0]
                             break
                 actions_tensor = torch.zeros(b_size, self.horizon, self.action_dim, device=self.device)
-
-        # Return dict as expected by WorldModelPolicy: {'actions': (B, H, D) or (B, 1, H, D)}
-        # Policy does outputs['actions'] and then indexes, so we return (B, H, D) and let it handle
-        # To match GradientSolver return format, return dict with 'actions' and 'init_action'
         return {
-            "actions": actions_tensor,  # (B, H, D) normalized
+            "actions": actions_tensor,
             "init_action": actions_tensor,
             "energy": torch.zeros(actions_tensor.shape[0], device=self.device),
         }
@@ -124,7 +126,7 @@ class DiagramSolver(GradientSolver):
             if init_action is not None and isinstance(init_action, torch.Tensor):
                 try:
                     warm = init_action[b]
-                    if warm.dim() == 3:  # (num_samples, H, D) -> take first
+                    if warm.dim() == 3:
                         warm = warm[0]
                     act_seq_init = torch.zeros(1, self.horizon, self.chunk_dim, device=device)
                     if warm.dim() == 2:
@@ -224,14 +226,14 @@ def run(cfg: DictConfig):
         s = OmegaConf.to_container(cfg.solver, resolve=True)
         for k in ["n_iter","lr","grad_clip","action_noise","action_bounds","action_chunk"]:
             if k in s: grad_cfg[k] = s[k]
-    grad_cfg.setdefault("n_iter", 50)
-    grad_cfg.setdefault("lr", 0.1)
-    grad_cfg.setdefault("grad_clip", None)
+    grad_cfg.setdefault("n_iter", 100)
+    grad_cfg.setdefault("lr", 0.5)
+    grad_cfg.setdefault("grad_clip", 10.0)
     grad_cfg.setdefault("action_noise", 0.0)
-    grad_cfg.setdefault("action_bounds", None)
+    grad_cfg.setdefault("action_bounds", (-1.0, 1.0))
     grad_cfg.setdefault("action_chunk", 5)
     print(f"Plan: horizon={plan_cfg.horizon} block={plan_cfg.action_block} Grad: {grad_cfg}")
-    solver = DiagramSolver(model=model, device="cuda", horizon=plan_cfg.horizon, action_dim=process["action"].mean_.shape[0], lr=grad_cfg.get("lr", 0.1), n_iter=grad_cfg.get("n_iter", 50), grad_clip=grad_cfg.get("grad_clip"), action_noise=grad_cfg.get("action_noise", 0.0), action_bounds=grad_cfg.get("action_bounds"), action_chunk=grad_cfg.get("action_chunk", 5), process=process)
+    solver = DiagramSolver(model=model, device="cuda", horizon=plan_cfg.horizon, action_dim=process["action"].mean_.shape[0], lr=grad_cfg.get("lr", 0.5), n_iter=grad_cfg.get("n_iter", 100), grad_clip=grad_cfg.get("grad_clip", 10.0), action_noise=grad_cfg.get("action_noise", 0.0), action_bounds=grad_cfg.get("action_bounds", (-1.0, 1.0)), action_chunk=grad_cfg.get("action_chunk", 5), process=process)
     policy = swm.policy.WorldModelPolicy(solver=solver, config=plan_cfg, process=process, transform=transform)
     episode_len = get_episodes_length(dataset, ep_indices)
     max_start = episode_len - cfg.eval.goal_offset_steps - 1
