@@ -1,4 +1,13 @@
 import os
+import multiprocessing as mp
+
+# Set multiprocessing start method to 'spawn' before any CUDA/Lance/Gym calls
+if __name__ == "__main__":
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
 os.environ["MUJOCO_GL"] = "egl"
 
 import time
@@ -16,28 +25,9 @@ import stable_worldmodel as swm
 from stable_worldmodel.solver.gd import GradientSolver
 
 # ---------------------------------------------------------------------------
-# PATCH: stable-worldmodel 0.1.1 bug — GradientSolver.init_action() /
-# prepare_init_action() leave the warm-start action tensor on CPU on the
-# very first planning call, causing:
-#   RuntimeError: Expected all tensors to be on the same device, but found
-#   at least two devices, cuda:0 and cpu!
-#
-# Root cause: when solve() is first called, init_action=None. In
-# prepare_init_action() (solver/utils.py), for a non-Actionable model this
-# branch runs:
-#     device = init_action.device if init_action is not None else 'cpu'
-# which hardcodes 'cpu' regardless of the solver's configured device, and
-# returns a full-horizon action tensor on CPU.
-#
-# Back in GradientSolver.init_action() (solver/gd.py), the only line that
-# moves `actions` to self.device is inside `if remaining > 0: ...`. Since
-# the tensor returned above already covers the full horizon, remaining == 0,
-# so that branch — and the device move — is skipped. The CPU actions tensor
-# is then combined in-place with a CUDA tensor from torch.randn(...,
-# device=self.device), which crashes.
-#
-# Fix: same as the original init_action, but always call actions.to(self.device)
-# right before use, not just inside the "remaining > 0" branch.
+# PATCH: stable-worldmodel 0.1.1 bug — GradientSolver.init_action()
+# Ensure all action tensors and random perturbations are explicitly placed
+# on self.device to avoid CPU/CUDA device mismatches on the initial call.
 # ---------------------------------------------------------------------------
 def _patched_init_action(self, n_envs, actions=None):
     if actions is None:
@@ -48,7 +38,7 @@ def _patched_init_action(self, n_envs, actions=None):
         new_actions = torch.zeros(n_envs, remaining, self.action_dim, dtype=self.dtype)
         actions = torch.cat([actions, new_actions], dim=1)
 
-    actions = actions.to(self.device)  # <-- always move, not just when padding was needed
+    actions = actions.to(self.device)  # Always ensure tensor is moved to target device
 
     actions = actions.unsqueeze(1).repeat_interleave(self.num_samples, dim=1)
     actions[:, 1:] += (
@@ -105,25 +95,27 @@ def get_dataset(cfg, dataset_name):
     )
     return dataset
 
+
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
-    """Run evaluation of dinowm vs random policy."""
+    """Run evaluation of learned world model vs random policy."""
     assert (
         cfg.plan_config.horizon * cfg.plan_config.action_block <= cfg.eval.eval_budget
     ), "Planning horizon must be smaller than or equal to eval_budget"
 
-    # create world environment
+    # Create world environment
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
     world = swm.World(**cfg.world, image_shape=(224, 224))
 
-    # create the transform
+    # Create image transforms
     transform = {
         "pixels": img_transform(cfg),
         "goal": img_transform(cfg),
     }
 
+    # Load dataset and calculate normalization statistics
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
-    stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
+    stats_dataset = dataset
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
     ep_indices, _ = np.unique(stats_dataset.get_col_data(col_name), return_index=True)
 
@@ -140,31 +132,30 @@ def run(cfg: DictConfig):
         if col != "action":
             process[f"goal_{col}"] = process[col]
 
-    # -- run evaluation
+    # Instantiate policy
     policy = cfg.get("policy", "random")
 
     if policy != "random":
-        
-        ckpt_path = cfg.policy 
+        ckpt_path = cfg.policy
         if not ckpt_path.endswith(".ckpt"):
-            ckpt_path += ".ckpt"  # Ensure it looks for a .ckpt file
-            
+            ckpt_path += ".ckpt"
+
         print(f"Loading local PyTorch model from {ckpt_path}...")
-        model = torch.load(ckpt_path, map_location="cpu", weights_only=False)        
-        
-        # --- FIX 1: Explicitly move the model to the GPU ---
+        model = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+        # Move model to CUDA and set evaluation modes
         model = model.to("cuda")
-        
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
+
         config = swm.PlanConfig(**cfg.plan_config)
         solver = hydra.utils.instantiate(cfg.solver, model=model, device="cuda")
-                    
+
         policy = swm.policy.WorldModelPolicy(
-            solver=solver, 
-            config=config, 
-            process=process, 
+            solver=solver,
+            config=config,
+            process=process,
             transform=transform,
         )
     else:
@@ -176,30 +167,29 @@ def run(cfg: DictConfig):
         else Path(__file__).parent
     )
 
-    # sample the episodes and the starting indices
+    # Sample starting indices for evaluation episodes
     episode_len = get_episodes_length(dataset, ep_indices)
     max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
     max_start_idx_dict = {ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)}
-    # Map each dataset row’s episode_idx to its max_start_idx
+
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
     max_start_per_row = np.array(
         [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
     )
 
-    # remove all the lines of dataset for which dataset['step_idx'] > max_start_per_row
+    # Filter for valid step starting points
     valid_mask = dataset.get_col_data("step_idx") <= max_start_per_row
     valid_indices = np.nonzero(valid_mask)[0]
-    print(valid_mask.sum(), "valid starting points found for evaluation.")
+    print(f"{valid_mask.sum()} valid starting points found for evaluation.")
 
     g = np.random.default_rng(cfg.seed)
     random_episode_indices = g.choice(
         len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False
     )
 
-    # sort increasingly to avoid issues with HDF5Dataset indexing
+    # Sort to optimize HDF5 slice access
     random_episode_indices = np.sort(valid_indices[random_episode_indices])
-
-    print(random_episode_indices)
+    print("Sampled episode indices:", random_episode_indices)
 
     eval_episodes = dataset.get_row_data(random_episode_indices)[col_name]
     eval_start_idx = dataset.get_row_data(random_episode_indices)["step_idx"]
@@ -210,6 +200,7 @@ def run(cfg: DictConfig):
     world.set_policy(policy)
     results_path.mkdir(parents=True, exist_ok=True)
 
+    # Execute evaluation loop
     start_time = time.time()
     metrics = world.evaluate(
         dataset=dataset,
@@ -221,22 +212,21 @@ def run(cfg: DictConfig):
         video=results_path,
     )
     end_time = time.time()
-        
-    print(metrics)
 
-    results_path = results_path / cfg.output.filename
-    results_path.parent.mkdir(parents=True, exist_ok=True)
+    print("\n==== Evaluation Complete ====")
+    print("Metrics:", metrics)
+    print(f"Total time: {end_time - start_time:.2f} seconds")
 
-    with results_path.open("a") as f:
-        f.write("\n")  # separate from previous runs
+    # Save output artifacts
+    results_file = results_path / cfg.output.filename
+    results_file.parent.mkdir(parents=True, exist_ok=True)
 
-        f.write("==== CONFIG ====\n")
+    with results_file.open("a") as f:
+        f.write("\n==== CONFIG ====\n")
         f.write(OmegaConf.to_yaml(cfg))
-        f.write("\n")
-
-        f.write("==== RESULTS ====\n")
+        f.write("\n==== RESULTS ====\n")
         f.write(f"metrics: {metrics}\n")
-        f.write(f"evaluation_time: {end_time - start_time} seconds\n")
+        f.write(f"evaluation_time: {end_time - start_time:.2f} seconds\n")
 
 
 if __name__ == "__main__":
