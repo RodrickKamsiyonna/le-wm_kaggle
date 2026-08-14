@@ -1,6 +1,5 @@
 import os
 os.environ["MUJOCO_GL"] = "egl"
-
 import time
 from pathlib import Path
 import hydra
@@ -11,9 +10,7 @@ from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_pretraining as spt
 import stable_worldmodel as swm
-
 from stable_worldmodel.solver.gd import GradientSolver
-from stable_worldmodel.solver.solver import Solver
 
 def _patched_init_action(self, n_envs, actions=None):
     if actions is None:
@@ -24,43 +21,25 @@ def _patched_init_action(self, n_envs, actions=None):
         actions = torch.cat([actions, new_actions], dim=1)
     actions = actions.to(self.device)
     actions = actions.unsqueeze(1).repeat_interleave(self.num_samples, dim=1)
-    actions[:, 1:] += (
-        torch.randn(actions[:, 1:].shape, generator=self.torch_gen, device=self.device, dtype=self.dtype) * self.var_scale
-    )
+    actions[:, 1:] += (torch.randn(actions[:, 1:].shape, generator=self.torch_gen, device=self.device, dtype=self.dtype) * self.var_scale)
     if hasattr(self, "init") and self.init.shape == actions.shape:
         self.init.copy_(actions)
     else:
         if "init" in self._parameters:
             del self._parameters["init"]
         self.register_parameter("init", torch.nn.Parameter(actions))
-
 GradientSolver.init_action = _patched_init_action
 
-class DiagramSolver(Solver):
-    # Override read-only properties from base Solver with writable versions
-    @property
-    def horizon(self):
-        return getattr(self, "_horizon", 5)
-    @horizon.setter
-    def horizon(self, v):
-        self._horizon = int(v)
-
-    @property
-    def action_dim(self):
-        return getattr(self, "_action_dim", 2)
-    @action_dim.setter
-    def action_dim(self, v):
-        self._action_dim = int(v)
-
-    def __init__(self, model, device="cuda", horizon=5, action_dim=2, lr=0.1, n_iter=50, 
-                 grad_clip=None, action_noise=0.0, action_bounds=None, action_chunk=5, 
-                 process=None, **kwargs):
-        super().__init__()
-        # Use private attrs to avoid property setter issues in base class
-        object.__setattr__(self, "_horizon", int(horizon))
-        object.__setattr__(self, "_action_dim", int(action_dim))
-        self.model = model
-        self.device = torch.device(device)
+class DiagramSolver(GradientSolver):
+    def __init__(self, model, device="cuda", horizon=5, action_dim=2, lr=0.1, n_iter=50, grad_clip=None, action_noise=0.0, action_bounds=None, action_chunk=5, process=None, **kwargs):
+        try:
+            super().__init__(model=model, device=device, action_dim=action_dim, **kwargs)
+        except TypeError:
+            super().__init__(model=model, device=device, action_dim=action_dim)
+        try:
+            self.horizon = horizon
+        except AttributeError:
+            object.__setattr__(self, "_horizon", int(horizon))
         self.action_chunk = action_chunk
         self.chunk_dim = action_chunk * action_dim
         self.lr = lr
@@ -69,11 +48,6 @@ class DiagramSolver(Solver):
         self.action_noise = action_noise
         self.action_bounds = action_bounds
         self.process = process
-        self.dtype = torch.float32
-        self.num_samples = 1
-        self.var_scale = 0.0
-        self.torch_gen = torch.Generator(device=self.device)
-        self.torch_gen.manual_seed(42)
         self.norm_lo = None
         self.norm_hi = None
         if action_bounds and process and "action" in process:
@@ -81,22 +55,6 @@ class DiagramSolver(Solver):
             proc = process["action"]
             self.norm_lo = proc.transform(np.array([[raw_lo]*action_dim]))[0,0]
             self.norm_hi = proc.transform(np.array([[raw_hi]*action_dim]))[0,0]
-        self.register_parameter("init", torch.nn.Parameter(torch.zeros(1,1,horizon,action_dim)))
-
-    def configure(self, envs=None, config=None, **kwargs):
-        if config is not None and hasattr(config, "horizon"):
-            self.horizon = config.horizon
-        return
-    def reset(self, *args, **kwargs): return
-    def clear(self, *args, **kwargs): return
-    def init_action(self, n_envs, actions=None):
-        if actions is None:
-            actions = torch.zeros((n_envs, 0, self.action_dim), dtype=self.dtype, device=self.device)
-        remaining = self.horizon - actions.shape[1]
-        if remaining > 0:
-            new_actions = torch.zeros(n_envs, remaining, self.action_dim, dtype=self.dtype, device=self.device)
-            actions = torch.cat([actions, new_actions], dim=1)
-        return actions.to(self.device)
     def solve(self, obs_emb, act_emb, goal_emb):
         B = obs_emb.shape[0]
         device = self.device
@@ -137,23 +95,14 @@ class DiagramSolver(Solver):
             first_norm = raw_norm[:, :self.action_dim]
             all_best.append(first_norm)
         return torch.tensor(np.stack(all_best, axis=0), device=device, dtype=torch.float32)
-    def plan(self, *args, **kwargs): return self.solve(*args, **kwargs)
-    def forward(self, *args, **kwargs): return self.solve(*args, **kwargs)
 
 def img_transform(cfg):
-    return transforms.Compose([
-        transforms.ToImage(),
-        transforms.ToDtype(torch.float32, scale=True),
-        transforms.Normalize(**spt.data.dataset_stats.ImageNet),
-        transforms.Resize(size=cfg.eval.img_size),
-    ])
-
+    return transforms.Compose([transforms.ToImage(), transforms.ToDtype(torch.float32, scale=True), transforms.Normalize(**spt.data.dataset_stats.ImageNet), transforms.Resize(size=cfg.eval.img_size)])
 def get_episodes_length(dataset, episodes):
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
     episode_idx = dataset.get_col_data(col_name)
     step_idx = dataset.get_col_data("step_idx")
     return np.array([np.max(step_idx[episode_idx == ep_id]) + 1 for ep_id in episodes])
-
 def get_dataset(cfg, dataset_name):
     dataset_path = Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
     return swm.data.HDF5Dataset(dataset_name, keys_to_cache=cfg.dataset.keys_to_cache, cache_dir=dataset_path)
@@ -161,7 +110,7 @@ def get_dataset(cfg, dataset_name):
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
     assert cfg.plan_config.horizon * cfg.plan_config.action_block <= cfg.eval.eval_budget
-    print(f"Device: cuda")
+    print("Device: cuda")
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
     if "num_envs" not in cfg.world: cfg.world.num_envs = 1
     world = swm.World(**cfg.world, image_shape=(224, 224))
@@ -206,14 +155,7 @@ def run(cfg: DictConfig):
     grad_cfg.setdefault("action_bounds", None)
     grad_cfg.setdefault("action_chunk", 5)
     print(f"Plan: horizon={plan_cfg.horizon} block={plan_cfg.action_block} Grad: {grad_cfg}")
-    solver = DiagramSolver(
-        model=model, device="cuda", horizon=plan_cfg.horizon,
-        action_dim=process["action"].mean_.shape[0],
-        lr=grad_cfg.get("lr", 0.1), n_iter=grad_cfg.get("n_iter", 50),
-        grad_clip=grad_cfg.get("grad_clip"), action_noise=grad_cfg.get("action_noise", 0.0),
-        action_bounds=grad_cfg.get("action_bounds"), action_chunk=grad_cfg.get("action_chunk", 5),
-        process=process,
-    )
+    solver = DiagramSolver(model=model, device="cuda", horizon=plan_cfg.horizon, action_dim=process["action"].mean_.shape[0], lr=grad_cfg.get("lr", 0.1), n_iter=grad_cfg.get("n_iter", 50), grad_clip=grad_cfg.get("grad_clip"), action_noise=grad_cfg.get("action_noise", 0.0), action_bounds=grad_cfg.get("action_bounds"), action_chunk=grad_cfg.get("action_chunk", 5), process=process)
     policy = swm.policy.WorldModelPolicy(solver=solver, config=plan_cfg, process=process, transform=transform)
     episode_len = get_episodes_length(dataset, ep_indices)
     max_start = episode_len - cfg.eval.goal_offset_steps - 1
@@ -231,18 +173,9 @@ def run(cfg: DictConfig):
     results_path.mkdir(parents=True, exist_ok=True)
     world.set_policy(policy)
     start = time.time()
-    metrics = world.evaluate(
-        dataset=dataset,
-        start_steps=eval_starts.tolist(),
-        goal_offset=cfg.eval.goal_offset_steps,
-        eval_budget=cfg.eval.eval_budget,
-        episodes_idx=eval_eps.tolist(),
-        callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True),
-        video=results_path,
-    )
+    metrics = world.evaluate(dataset=dataset, start_steps=eval_starts.tolist(), goal_offset=cfg.eval.goal_offset_steps, eval_budget=cfg.eval.eval_budget, episodes_idx=eval_eps.tolist(), callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True), video=results_path)
     print(metrics)
     with (results_path / cfg.output.filename).open("a") as f:
         f.write(f"\nmetrics: {metrics}\ntime: {time.time()-start}\n")
-
 if __name__ == "__main__":
     run()
