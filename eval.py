@@ -1,5 +1,4 @@
 import os
-
 os.environ["MUJOCO_GL"] = "egl"
 
 import time
@@ -13,6 +12,66 @@ from omegaconf import DictConfig, OmegaConf
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
+
+from stable_worldmodel.solver.gd import GradientSolver
+
+# ---------------------------------------------------------------------------
+# PATCH: stable-worldmodel 0.1.1 bug — GradientSolver.init_action() /
+# prepare_init_action() leave the warm-start action tensor on CPU on the
+# very first planning call, causing:
+#   RuntimeError: Expected all tensors to be on the same device, but found
+#   at least two devices, cuda:0 and cpu!
+#
+# Root cause: when solve() is first called, init_action=None. In
+# prepare_init_action() (solver/utils.py), for a non-Actionable model this
+# branch runs:
+#     device = init_action.device if init_action is not None else 'cpu'
+# which hardcodes 'cpu' regardless of the solver's configured device, and
+# returns a full-horizon action tensor on CPU.
+#
+# Back in GradientSolver.init_action() (solver/gd.py), the only line that
+# moves `actions` to self.device is inside `if remaining > 0: ...`. Since
+# the tensor returned above already covers the full horizon, remaining == 0,
+# so that branch — and the device move — is skipped. The CPU actions tensor
+# is then combined in-place with a CUDA tensor from torch.randn(...,
+# device=self.device), which crashes.
+#
+# Fix: same as the original init_action, but always call actions.to(self.device)
+# right before use, not just inside the "remaining > 0" branch.
+# ---------------------------------------------------------------------------
+def _patched_init_action(self, n_envs, actions=None):
+    if actions is None:
+        actions = torch.zeros((n_envs, 0, self.action_dim), dtype=self.dtype)
+
+    remaining = self.horizon - actions.shape[1]
+    if remaining > 0:
+        new_actions = torch.zeros(n_envs, remaining, self.action_dim, dtype=self.dtype)
+        actions = torch.cat([actions, new_actions], dim=1)
+
+    actions = actions.to(self.device)  # <-- always move, not just when padding was needed
+
+    actions = actions.unsqueeze(1).repeat_interleave(self.num_samples, dim=1)
+    actions[:, 1:] += (
+        torch.randn(
+            actions[:, 1:].shape,
+            generator=self.torch_gen,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        * self.var_scale
+    )
+
+    if hasattr(self, "init") and self.init.shape == actions.shape:
+        self.init.copy_(actions)
+    else:
+        if "init" in self._parameters:
+            del self._parameters["init"]
+        self.register_parameter("init", torch.nn.Parameter(actions))
+
+
+GradientSolver.init_action = _patched_init_action
+# ---------------------------------------------------------------------------
+
 
 def img_transform(cfg):
     transform = transforms.Compose(
@@ -85,6 +144,7 @@ def run(cfg: DictConfig):
     policy = cfg.get("policy", "random")
 
     if policy != "random":
+        
         ckpt_path = cfg.policy 
         if not ckpt_path.endswith(".ckpt"):
             ckpt_path += ".ckpt"  # Ensure it looks for a .ckpt file
@@ -92,16 +152,21 @@ def run(cfg: DictConfig):
         print(f"Loading local PyTorch model from {ckpt_path}...")
         model = torch.load(ckpt_path, map_location="cpu", weights_only=False)        
         
+        # --- FIX 1: Explicitly move the model to the GPU ---
         model = model.to("cuda")
+        
         model = model.eval()
         model.requires_grad_(False)
         model.interpolate_pos_encoding = True
         config = swm.PlanConfig(**cfg.plan_config)
         solver = hydra.utils.instantiate(cfg.solver, model=model, device="cuda")
+                    
         policy = swm.policy.WorldModelPolicy(
-            solver=solver, config=config, process=process, transform=transform
+            solver=solver, 
+            config=config, 
+            process=process, 
+            transform=transform,
         )
-
     else:
         policy = swm.policy.RandomPolicy()
 
@@ -143,7 +208,6 @@ def run(cfg: DictConfig):
         raise ValueError("Not enough episodes with sufficient length for evaluation.")
 
     world.set_policy(policy)
-
     results_path.mkdir(parents=True, exist_ok=True)
 
     start_time = time.time()
@@ -157,7 +221,7 @@ def run(cfg: DictConfig):
         video=results_path,
     )
     end_time = time.time()
-    
+        
     print(metrics)
 
     results_path = results_path / cfg.output.filename
