@@ -18,8 +18,8 @@ dataset:
     - proprio
 
 plan_config:
-  horizon: 25
-  receding_horizon: 25
+  horizon: 5
+  receding_horizon: 5
   action_block: 5 # frameskip
 
 # evaluation from dataset (replay expert trajectories)
