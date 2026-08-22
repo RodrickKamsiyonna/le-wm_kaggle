@@ -19,7 +19,7 @@ dataset:
 
 plan_config:
   horizon: 5
-  receding_horizon: 5
+  receding_horizon: 1
   action_block: 5 # frameskip
 
 # evaluation from dataset (replay expert trajectories)
