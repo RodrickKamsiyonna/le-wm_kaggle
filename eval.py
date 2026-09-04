@@ -72,35 +72,17 @@ class ExplicitGradientSolver:
         self._action_block = int(config.action_block)
         self._horizon = int(config.horizon)
 
-        # IMPORTANT: Do NOT infer the raw action dimension from
-        # process["action"] here. In this evaluation setup the cached dataset
-        # action column can already contain a flattened/chunked representation
-        # (e.g. 100 features), while the environment still emits the true
-        # PushT action (x, y) = 2 features.
-        #
-        # The authoritative dimension for the optimizer is the input dimension
-        # of the model's action encoder. For action_block=5 and PushT, the JEPA
-        # action encoder expects 10 features, hence the raw action dimension is
-        # 10 / 5 = 2.
-        encoder_in_dim = None
+        # Ground truth environment action dimension (2 for PushT)
+        self._single_action_dim = int(np.prod(action_space.shape))
+
+        # Expected input features per step into model.action_encoder
         action_encoder = getattr(self.model, "action_encoder", None)
-        if action_encoder is not None:
-            encoder_in_dim = getattr(action_encoder, "in_features", None)
+        encoder_in_dim = getattr(action_encoder, "in_features", None) if action_encoder is not None else None
 
         if encoder_in_dim is not None:
-            encoder_in_dim = int(encoder_in_dim)
-            if encoder_in_dim % self._action_block != 0:
-                raise ValueError(
-                    f"Model action_encoder.in_features={encoder_in_dim} is not "
-                    f"divisible by action_block={self._action_block}."
-                )
-            self._single_action_dim = encoder_in_dim // self._action_block
+            self._action_dim = int(encoder_in_dim)
         else:
-            # Fallback only when the action encoder does not expose in_features.
-            env_dim = int(np.prod(action_space.shape))
-            self._single_action_dim = env_dim
-
-        self._action_dim = self._single_action_dim * self._action_block
+            self._action_dim = self._single_action_dim * self._action_block
 
         print(
             f"ExplicitGradientSolver configured: raw_action_dim={self._single_action_dim}, "
@@ -149,8 +131,6 @@ class ExplicitGradientSolver:
         """Build the context dictionary used by model.encode()."""
         context = {}
 
-        # Keep the same observation information used by the supplied diagram.
-        # Control/termination metadata should not be fed into the encoder.
         ignored = {
             "goal",
             "goal_pixels",
@@ -164,8 +144,7 @@ class ExplicitGradientSolver:
             if key not in ignored:
                 context[key] = self._move_to_device(value)
 
-        # The JEPA action encoder expects CHUNKED actions:
-        # raw PushT action (..., 2), action_block=5 -> encoder input (..., 10).
+        # Match encoder expectations: repeated/chunked to self._action_dim
         def chunk_current_action(x: torch.Tensor) -> torch.Tensor:
             x = x.to(self.device)
 
@@ -178,23 +157,21 @@ class ExplicitGradientSolver:
                 )
 
             raw_dim = self._single_action_dim
-            chunked_dim = raw_dim * self._action_block
+            target_dim = self._action_dim
 
-            if x.shape[-1] == chunked_dim:
+            if x.shape[-1] == target_dim:
                 return x
 
-            if x.shape[-1] != raw_dim:
-                raise ValueError(
-                    f"Unexpected current action dimension {x.shape[-1]}. "
-                    f"Expected raw dim {raw_dim} or chunked dim {chunked_dim}."
-                )
+            if x.shape[-1] == raw_dim:
+                repeat_factor = target_dim // raw_dim
+                return x.repeat(1, 1, repeat_factor)
 
-            # Same operation as the explicit diagram: t.repeat(1, action_chunk).
-            return x.repeat(1, 1, self._action_block)
+            raise ValueError(
+                f"Unexpected current action dimension {x.shape[-1]}. "
+                f"Expected raw dim {raw_dim} or target dim {target_dim}."
+            )
 
         if "action_history" in info_dict:
-            # stable-worldmodel supplies action_history already in solver space
-            # (chunked per action block). Do NOT repeat it again.
             hist = self._move_to_device(info_dict["action_history"])
             if hist.ndim == 2:
                 hist = hist.unsqueeze(1)
@@ -203,12 +180,16 @@ class ExplicitGradientSolver:
                     f"Expected action_history with shape (B, T, D), got {tuple(hist.shape)}"
                 )
 
-            expected_dim = self._single_action_dim * self._action_block
+            expected_dim = self._action_dim
             if hist.shape[-1] != expected_dim:
-                raise ValueError(
-                    f"Unexpected action_history dimension {hist.shape[-1]}. "
-                    f"Expected solver/chunked dim {expected_dim}."
-                )
+                # If history arrives as raw dimensions, tile to match encoder expectation
+                if hist.shape[-1] == self._single_action_dim:
+                    hist = hist.repeat(1, 1, expected_dim // self._single_action_dim)
+                else:
+                    raise ValueError(
+                        f"Unexpected action_history dimension {hist.shape[-1]}. "
+                        f"Expected solver/chunked dim {expected_dim} or raw dim {self._single_action_dim}."
+                    )
 
             current = info_dict.get("action")
             if current is not None and torch.is_tensor(current):
@@ -231,7 +212,6 @@ class ExplicitGradientSolver:
             "pixels": self._move_to_device(info_dict["goal"]),
         }
 
-        # Preserve any explicit goal-side auxiliary features if present.
         for key, value in info_dict.items():
             if key.startswith("goal_") and key != "goal_pixels":
                 goal[key] = self._move_to_device(value)
@@ -243,15 +223,11 @@ class ExplicitGradientSolver:
         if self.action_bounds is None or "action" not in self.process:
             return None
 
-        # Bounds are only valid when the scaler itself represents the raw
-        # action dimension. Some PushT datasets store a flattened historical
-        # action representation with many more features, so do not attempt to
-        # apply those bounds in that case.
         scaler_dim = int(self.process["action"].mean_.shape[0])
         if scaler_dim != self._single_action_dim:
             print(
                 f"Skipping action bounds: scaler action dim={scaler_dim}, "
-                f"but raw PushT action dim={self._single_action_dim}."
+                f"but raw action dim={self._single_action_dim}."
             )
             return None
 
@@ -267,10 +243,9 @@ class ExplicitGradientSolver:
         lo = self.process["action"].transform(raw_lo.reshape(1, -1))[0]
         hi = self.process["action"].transform(raw_hi.reshape(1, -1))[0]
 
-        # The action encoder receives action chunks, so repeat the per-action
-        # bound for every action in a chunk.
-        lo = np.tile(lo, self._action_block)
-        hi = np.tile(hi, self._action_block)
+        repeat_factor = self._action_dim // self._single_action_dim
+        lo = np.tile(lo, repeat_factor)
+        hi = np.tile(hi, repeat_factor)
         return torch.as_tensor(lo, device=self.device, dtype=self.dtype), torch.as_tensor(
             hi, device=self.device, dtype=self.dtype
         )
@@ -290,10 +265,7 @@ class ExplicitGradientSolver:
         else:
             actions = init_action.to(device=self.device, dtype=self.dtype).clone().detach()
 
-            # WorldModelPolicy warm-starts with the remaining horizon. Pad if
-            # necessary so the explicit rollout always sees the configured horizon.
             if actions.ndim == 4:
-                # Defensive support for an old solver-style sample dimension.
                 actions = actions[:, 0]
 
             if actions.shape[1] < self.horizon:
@@ -328,8 +300,6 @@ class ExplicitGradientSolver:
         act_seq: torch.Tensor,
         return_per_env: bool = False,
     ):
-        # Encode context and goal without tracking gradients for the encoders,
-        # exactly as in the supplied diagram.
         with torch.no_grad():
             ctx_output = self.model.encode(context_data)
             ctx_emb = ctx_output["emb"]
@@ -338,8 +308,6 @@ class ExplicitGradientSolver:
             goal_output = self.model.encode(goal_data)
             goal_emb = goal_output["emb"][:, -1]
 
-        # Keep gradient tracking ONLY on the path from actions -> action
-        # embedding -> model predictions -> final latent -> energy.
         act_emb_seq = self.model.action_encoder(act_seq)
 
         current_ctx_emb = ctx_emb
@@ -364,15 +332,10 @@ class ExplicitGradientSolver:
             current_ctx_act = full_act_ctx
             final_pred_emb = pred_emb
 
-        # EXACT objective from the diagram:
-        # energy = (pred - target)^2 summed over latent dimensions and batch,
-        # implemented as a mean MSE scalar.
         sq_error = (final_pred_emb - goal_emb.detach()).pow(2)
         energy = sq_error.mean()
 
         if return_per_env:
-            # Logging metric only; optimization still uses the exact global
-            # mean scalar above, matching the supplied diagram.
             per_env_mse = sq_error.flatten(start_dim=1).mean(dim=1)
             return energy, per_env_mse.detach()
 
@@ -396,10 +359,8 @@ class ExplicitGradientSolver:
         bounds = self._normalized_bounds()
 
         for step in range(self.n_steps):
-            # Rebuild the graph every iteration, as in the diagram.
             energy = self._latent_energy(context, goal, actions)
 
-            # Explicit exact gradient with respect to action variables.
             grad_energy = torch.autograd.grad(
                 energy,
                 actions,
@@ -417,12 +378,8 @@ class ExplicitGradientSolver:
                             self.grad_clip / (grad_norm + 1e-6)
                         )
 
-                # Manual gradient descent, exactly as in the supplied code.
                 actions -= self.lr * grad_energy
 
-                # Optional Langevin/action noise. With action_noise=0.0 this
-                # contributes nothing, so the optimization is deterministic
-                # after its initial torch.randn() action initialization.
                 if self.action_noise > 0.0:
                     actions += self.action_noise * torch.randn(
                         actions.shape,
@@ -437,9 +394,6 @@ class ExplicitGradientSolver:
 
             actions.requires_grad_(True)
 
-        # Compute the final energy one more time so the returned cost is the
-        # actual cost of the final optimized action sequence. Also log one
-        # final latent MSE per episode/environment.
         final_energy, final_per_env_mse = self._latent_energy(
             context, goal, actions, return_per_env=True
         )
@@ -468,8 +422,6 @@ class ExplicitGradientSolver:
             print(f"Episode {ep_label}: final_MSE={mse:.8f}")
         print(f"Batch mean final MSE: {final_energy.item():.8f}")
 
-        # WorldModelPolicy expects one plan per env. We return the action
-        # sequence directly on CPU, without a sample dimension.
         actions_out = actions.detach().cpu()
 
         elapsed = time.time() - start_time
@@ -587,7 +539,6 @@ def run(cfg: DictConfig):
 
         config = swm.PlanConfig(**cfg.plan_config)
 
-        # Read the same gradient settings from the existing solver config.
         solver_cfg = cfg.get("solver", cfg.get("gradient_solver", {}))
         optimizer_kwargs = solver_cfg.get("optimizer_kwargs", {})
         lr = float(optimizer_kwargs.get("lr", 1.0))
