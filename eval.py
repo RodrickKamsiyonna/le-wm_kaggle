@@ -131,21 +131,50 @@ class ExplicitGradientSolver:
             if key not in ignored:
                 context[key] = self._move_to_device(value)
 
-        # With history_len > 1, WorldModelPolicy supplies executed action blocks
-        # under action_history. Reconstruct a time-aligned action sequence by
-        # appending the current action. For history_len == 1 this simply keeps
-        # the current action already present in info_dict.
+        # The JEPA action encoder expects CHUNKED actions:
+        # raw PushT action (..., 2), action_block=5 -> encoder input (..., 10).
+        # This matches the explicit planner, which tiles the action before
+        # passing it through model.action_encoder().
+        def chunk_action(x: torch.Tensor) -> torch.Tensor:
+            x = x.to(self.device)
+
+            if x.ndim == 2:
+                x = x.unsqueeze(1)  # (B, D) -> (B, 1, D)
+            elif x.ndim != 3:
+                raise ValueError(
+                    f"Expected action tensor with shape (B, D) or (B, T, D), "
+                    f"got {tuple(x.shape)}"
+                )
+
+            raw_dim = self._single_action_dim
+            expected_dim = raw_dim * self._action_block
+
+            if x.shape[-1] == expected_dim:
+                return x
+
+            if x.shape[-1] != raw_dim:
+                raise ValueError(
+                    f"Unexpected action dimension {x.shape[-1]}. "
+                    f"Expected raw dim {raw_dim} or chunked dim {expected_dim}."
+                )
+
+            # Same operation as the explicit diagram:
+            # t.repeat(1, action_chunk)
+            return x.repeat(1, 1, self._action_block)
+
         if "action_history" in info_dict:
             hist = self._move_to_device(info_dict["action_history"])
-            current = info_dict.get("action")
+            hist = chunk_action(hist)
 
-            if torch.is_tensor(current):
-                current = current.to(self.device)
-                if current.ndim == 2:
-                    current = current.unsqueeze(1)
+            current = info_dict.get("action")
+            if current is not None and torch.is_tensor(current):
+                current = chunk_action(current)
                 context["action"] = torch.cat([hist, current], dim=1)
             else:
                 context["action"] = hist
+
+        elif "action" in info_dict and torch.is_tensor(info_dict["action"]):
+            context["action"] = chunk_action(info_dict["action"])
 
         return context
 
