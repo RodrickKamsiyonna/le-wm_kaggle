@@ -17,18 +17,6 @@ import stable_worldmodel as swm
 # ---------------------------------------------------------------------------
 # Explicit gradient planner
 # ---------------------------------------------------------------------------
-# This deliberately mirrors the optimization code from the supplied diagram:
-#
-#   act_emb_seq = model.action_encoder(act_seq)
-#   rollout through model.predict(...)
-#   energy = (final_pred_emb - goal_emb).pow(2).mean()
-#   grad_energy = torch.autograd.grad(energy, act_seq)[0]
-#   act_seq -= lr * grad_energy
-#
-# There is NO optimizer object, NO model.get_cost(), and NO .backward().
-# The world-model parameters stay frozen, but gradients are still propagated
-# through the frozen model with respect to the action sequence.
-# ---------------------------------------------------------------------------
 class ExplicitGradientSolver:
     """Gradient-descent planner using an explicit latent MSE objective."""
 
@@ -43,6 +31,9 @@ class ExplicitGradientSolver:
         seed: int = 1234,
         process: dict | None = None,
         action_bounds=None,
+        action_block: int = 5,
+        horizon: int = 5,
+        raw_action_dim: int = 2,
     ):
         self.model = model
         self.n_steps = int(n_steps)
@@ -54,28 +45,11 @@ class ExplicitGradientSolver:
         self.action_bounds = action_bounds
 
         self.generator = torch.Generator(device=self.device).manual_seed(seed)
-        self._configured = False
-        self._n_envs = None
-        self._action_dim = None
-        self._action_block = 1
-        self._horizon = None
-        self._dtype = torch.float32
+        self._action_block = int(action_block)
+        self._horizon = int(horizon)
+        self._single_action_dim = int(raw_action_dim)
 
-        try:
-            self._dtype = next(model.parameters()).dtype
-        except (AttributeError, StopIteration):
-            pass
-
-    def configure(self, *, action_space, n_envs: int, config):
-        self._configured = True
-        self._n_envs = int(n_envs)
-        self._action_block = int(config.action_block)
-        self._horizon = int(config.horizon)
-
-        # Ground truth environment action dimension (2 for PushT)
-        self._single_action_dim = int(np.prod(action_space.shape))
-
-        # Expected input features per step into model.action_encoder
+        # Inspect model action encoder for the actual expected dimension
         action_encoder = getattr(self.model, "action_encoder", None)
         encoder_in_dim = getattr(action_encoder, "in_features", None) if action_encoder is not None else None
 
@@ -84,8 +58,49 @@ class ExplicitGradientSolver:
         else:
             self._action_dim = self._single_action_dim * self._action_block
 
+        self._n_envs = None
+        self._configured = True
+        self._dtype = torch.float32
+
+        try:
+            self._dtype = next(model.parameters()).dtype
+        except (AttributeError, StopIteration):
+            pass
+
         print(
-            f"ExplicitGradientSolver configured: raw_action_dim={self._single_action_dim}, "
+            f"ExplicitGradientSolver initialized: raw_action_dim={self._single_action_dim}, "
+            f"action_block={self._action_block}, "
+            f"optimized_action_dim={self._action_dim}, "
+            f"horizon={self._horizon}"
+        )
+
+    def configure(self, *, action_space=None, n_envs: int = 1, config=None, **kwargs):
+        """Hook called by World / WorldModelPolicy."""
+        self._configured = True
+        if n_envs is not None:
+            self._n_envs = int(n_envs)
+        if config is not None:
+            if hasattr(config, "action_block"):
+                self._action_block = int(config.action_block)
+            if hasattr(config, "horizon"):
+                self._horizon = int(config.horizon)
+
+        # PushT environment action space is always 2 (x, y)
+        if action_space is not None and hasattr(action_space, "shape") and len(action_space.shape) > 0:
+            env_dim = int(np.prod(action_space.shape))
+            # Only override if reasonable (e.g. gym box 2D), not dataset 100D
+            if env_dim <= 10:
+                self._single_action_dim = env_dim
+
+        action_encoder = getattr(self.model, "action_encoder", None)
+        encoder_in_dim = getattr(action_encoder, "in_features", None) if action_encoder is not None else None
+        if encoder_in_dim is not None:
+            self._action_dim = int(encoder_in_dim)
+        else:
+            self._action_dim = self._single_action_dim * self._action_block
+
+        print(
+            f"ExplicitGradientSolver re-configured: raw_action_dim={self._single_action_dim}, "
             f"action_block={self._action_block}, "
             f"optimized_action_dim={self._action_dim}, "
             f"horizon={self._horizon}"
@@ -127,6 +142,32 @@ class ExplicitGradientSolver:
             return torch.from_numpy(value).to(self.device)
         return value
 
+    def _adapt_action_tensor(self, x: torch.Tensor) -> torch.Tensor:
+        """Adapts an incoming action tensor (whether 2D, chunked, or flat) to self._action_dim."""
+        x = x.to(self.device)
+        if x.ndim == 2:
+            x = x.unsqueeze(1)  # (B, D) -> (B, 1, D)
+        elif x.ndim != 3:
+            raise ValueError(f"Expected action tensor with shape (B, D) or (B, T, D), got {tuple(x.shape)}")
+
+        current_feat = x.shape[-1]
+        target_feat = self._action_dim
+
+        if current_feat == target_feat:
+            return x
+
+        # If it's a raw 2D PushT action, tile it up to the model's expected dimension
+        if target_feat % current_feat == 0:
+            repeat_factor = target_feat // current_feat
+            return x.repeat(1, 1, repeat_factor)
+
+        # Fallback: slice or zero-pad if there's a structural mismatch
+        if current_feat > target_feat:
+            return x[..., :target_feat]
+        else:
+            pad = torch.zeros(*x.shape[:-1], target_feat - current_feat, device=x.device, dtype=x.dtype)
+            return torch.cat([x, pad], dim=-1)
+
     def _build_context(self, info_dict: dict) -> dict:
         """Build the context dictionary used by model.encode()."""
         context = {}
@@ -144,62 +185,19 @@ class ExplicitGradientSolver:
             if key not in ignored:
                 context[key] = self._move_to_device(value)
 
-        # Match encoder expectations: repeated/chunked to self._action_dim
-        def chunk_current_action(x: torch.Tensor) -> torch.Tensor:
-            x = x.to(self.device)
-
-            if x.ndim == 2:
-                x = x.unsqueeze(1)  # (B, D) -> (B, 1, D)
-            elif x.ndim != 3:
-                raise ValueError(
-                    f"Expected current action tensor with shape (B, D) or (B, T, D), "
-                    f"got {tuple(x.shape)}"
-                )
-
-            raw_dim = self._single_action_dim
-            target_dim = self._action_dim
-
-            if x.shape[-1] == target_dim:
-                return x
-
-            if x.shape[-1] == raw_dim:
-                repeat_factor = target_dim // raw_dim
-                return x.repeat(1, 1, repeat_factor)
-
-            raise ValueError(
-                f"Unexpected current action dimension {x.shape[-1]}. "
-                f"Expected raw dim {raw_dim} or target dim {target_dim}."
-            )
-
         if "action_history" in info_dict:
             hist = self._move_to_device(info_dict["action_history"])
-            if hist.ndim == 2:
-                hist = hist.unsqueeze(1)
-            if hist.ndim != 3:
-                raise ValueError(
-                    f"Expected action_history with shape (B, T, D), got {tuple(hist.shape)}"
-                )
-
-            expected_dim = self._action_dim
-            if hist.shape[-1] != expected_dim:
-                # If history arrives as raw dimensions, tile to match encoder expectation
-                if hist.shape[-1] == self._single_action_dim:
-                    hist = hist.repeat(1, 1, expected_dim // self._single_action_dim)
-                else:
-                    raise ValueError(
-                        f"Unexpected action_history dimension {hist.shape[-1]}. "
-                        f"Expected solver/chunked dim {expected_dim} or raw dim {self._single_action_dim}."
-                    )
+            hist = self._adapt_action_tensor(hist)
 
             current = info_dict.get("action")
             if current is not None and torch.is_tensor(current):
-                current = chunk_current_action(current)
+                current = self._adapt_action_tensor(current)
                 context["action"] = torch.cat([hist, current], dim=1)
             else:
                 context["action"] = hist
 
         elif "action" in info_dict and torch.is_tensor(info_dict["action"]):
-            context["action"] = chunk_current_action(info_dict["action"])
+            context["action"] = self._adapt_action_tensor(info_dict["action"])
 
         return context
 
@@ -219,39 +217,36 @@ class ExplicitGradientSolver:
         return goal
 
     def _normalized_bounds(self):
-        """Convert raw action bounds to the same normalized action space as process['action']."""
+        """Convert raw action bounds to normalized space."""
         if self.action_bounds is None or "action" not in self.process:
             return None
 
-        scaler_dim = int(self.process["action"].mean_.shape[0])
-        if scaler_dim != self._single_action_dim:
-            print(
-                f"Skipping action bounds: scaler action dim={scaler_dim}, "
-                f"but raw action dim={self._single_action_dim}."
-            )
-            return None
+        scaler = self.process["action"]
+        scaler_dim = int(scaler.mean_.shape[0])
 
         raw_lo, raw_hi = self.action_bounds
         raw_lo = np.asarray(raw_lo, dtype=np.float32)
         raw_hi = np.asarray(raw_hi, dtype=np.float32)
 
-        if raw_lo.ndim == 0:
-            raw_lo = np.full((self._single_action_dim,), raw_lo.item(), dtype=np.float32)
-        if raw_hi.ndim == 0:
-            raw_hi = np.full((self._single_action_dim,), raw_hi.item(), dtype=np.float32)
+        if scaler_dim == self._single_action_dim:
+            if raw_lo.ndim == 0:
+                raw_lo = np.full((self._single_action_dim,), raw_lo.item(), dtype=np.float32)
+            if raw_hi.ndim == 0:
+                raw_hi = np.full((self._single_action_dim,), raw_hi.item(), dtype=np.float32)
 
-        lo = self.process["action"].transform(raw_lo.reshape(1, -1))[0]
-        hi = self.process["action"].transform(raw_hi.reshape(1, -1))[0]
+            lo = scaler.transform(raw_lo.reshape(1, -1))[0]
+            hi = scaler.transform(raw_hi.reshape(1, -1))[0]
 
-        repeat_factor = self._action_dim // self._single_action_dim
-        lo = np.tile(lo, repeat_factor)
-        hi = np.tile(hi, repeat_factor)
-        return torch.as_tensor(lo, device=self.device, dtype=self.dtype), torch.as_tensor(
-            hi, device=self.device, dtype=self.dtype
-        )
+            repeat_factor = max(1, self._action_dim // self._single_action_dim)
+            lo = np.tile(lo, repeat_factor)[: self._action_dim]
+            hi = np.tile(hi, repeat_factor)[: self._action_dim]
+            return torch.as_tensor(lo, device=self.device, dtype=self.dtype), torch.as_tensor(
+                hi, device=self.device, dtype=self.dtype
+            )
+
+        return None
 
     def _initial_action(self, batch_size: int, init_action: torch.Tensor | None):
-        """Initialize exactly like the explicit diagram: one random sequence per env."""
         if init_action is None:
             actions = torch.randn(
                 batch_size,
@@ -267,6 +262,9 @@ class ExplicitGradientSolver:
 
             if actions.ndim == 4:
                 actions = actions[:, 0]
+
+            if actions.shape[-1] != self.action_dim:
+                actions = self._adapt_action_tensor(actions)
 
             if actions.shape[1] < self.horizon:
                 pad = torch.zeros(
@@ -342,9 +340,6 @@ class ExplicitGradientSolver:
         return energy
 
     def solve(self, info_dict: dict, init_action: torch.Tensor | None = None) -> dict:
-        if not self._configured:
-            raise RuntimeError("ExplicitGradientSolver.configure() must be called before solve().")
-
         start_time = time.time()
 
         first = self._first_tensor(info_dict)
@@ -483,7 +478,6 @@ def run(cfg: DictConfig):
         cfg.plan_config.horizon * cfg.plan_config.action_block <= cfg.eval.eval_budget
     ), "Planning horizon must be smaller than or equal to eval_budget"
 
-    # Create world environment.
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
     world = swm.World(**cfg.world, image_shape=(224, 224))
 
@@ -553,6 +547,9 @@ def run(cfg: DictConfig):
             seed=int(cfg.get("seed", 1234)),
             process=process,
             action_bounds=solver_cfg.get("action_bounds", None),
+            action_block=int(cfg.plan_config.action_block),
+            horizon=int(cfg.plan_config.horizon),
+            raw_action_dim=2,
         )
 
         policy = swm.policy.WorldModelPolicy(
