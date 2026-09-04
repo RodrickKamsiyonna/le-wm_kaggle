@@ -177,7 +177,7 @@ def run_optimization_and_plot(
 
         # --- Compute Energy and Autograd Gradient ---
         # energy = (pred - target)^2 summed over latent dimensions and batch
-        energy = (final_pred_emb - goal_emb.detach()).pow(2).sum(dim=-1).sum()
+        energy = (final_pred_emb - goal_emb.detach()).pow(2).mean()
         
         # Calculate exact gradient wrt act_seq
         grad_energy = torch.autograd.grad(
