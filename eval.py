@@ -51,15 +51,6 @@ def _patched_init_action(self, n_envs, actions=None):
     actions = actions.to(self.device)  # <-- always move, not just when padding was needed
 
     actions = actions.unsqueeze(1).repeat_interleave(self.num_samples, dim=1)
-    actions[:, 1:] += (
-        torch.randn(
-            actions[:, 1:].shape,
-            generator=self.torch_gen,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        * self.var_scale
-    )
 
     if hasattr(self, "init") and self.init.shape == actions.shape:
         self.init.copy_(actions)
