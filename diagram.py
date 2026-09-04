@@ -141,7 +141,7 @@ def run_optimization_and_plot(
         with torch.no_grad():
             act_seq.clamp_(norm_lo, norm_hi)
 
-    lr = grad_cfg.get("lr", 0.1)
+    lr = 1.0
     n_iter = grad_cfg.get("n_iter", 50)
     mse_history = []
 
