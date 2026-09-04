@@ -342,7 +342,7 @@ def main(cfg: DictConfig):
     plan_config = swm.PlanConfig(**cfg.plan_config)
     grad_config = cfg.get("gradient_solver", {})
     
-    grad_config["n_iter"] = 500
+    grad_config["n_iter"] = 1000
 
     run_optimization_and_plot(
         model,
