@@ -8,6 +8,6 @@ device: "cuda"
 seed: ${seed}
 optimizer_cls:
   _target_: hydra.utils.get_class
-  path: torch.optim.Adam
+  path: torch.optim.SGD
 optimizer_kwargs:
   lr: 0.1
