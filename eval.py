@@ -15,10 +15,10 @@ import stable_worldmodel as swm
 
 
 # ---------------------------------------------------------------------------
-# Explicit gradient planner
+# Explicit gradient planner (Sequential / One-by-One)
 # ---------------------------------------------------------------------------
 class ExplicitGradientSolver:
-    """Gradient-descent planner using an explicit latent MSE objective."""
+    """Gradient-descent planner running per-episode sequential optimization."""
 
     def __init__(
         self,
@@ -49,7 +49,6 @@ class ExplicitGradientSolver:
         self._horizon = int(horizon)
         self._single_action_dim = int(raw_action_dim)
 
-        # Inspect model action encoder for the actual expected dimension
         action_encoder = getattr(self.model, "action_encoder", None)
         encoder_in_dim = getattr(action_encoder, "in_features", None) if action_encoder is not None else None
 
@@ -68,14 +67,13 @@ class ExplicitGradientSolver:
             pass
 
         print(
-            f"ExplicitGradientSolver initialized: raw_action_dim={self._single_action_dim}, "
+            f"ExplicitGradientSolver initialized (Sequential Mode): raw_action_dim={self._single_action_dim}, "
             f"action_block={self._action_block}, "
             f"optimized_action_dim={self._action_dim}, "
             f"horizon={self._horizon}"
         )
 
     def configure(self, *, action_space=None, n_envs: int = 1, config=None, **kwargs):
-        """Hook called by World / WorldModelPolicy."""
         self._configured = True
         if n_envs is not None:
             self._n_envs = int(n_envs)
@@ -85,10 +83,8 @@ class ExplicitGradientSolver:
             if hasattr(config, "horizon"):
                 self._horizon = int(config.horizon)
 
-        # PushT environment action space is always 2 (x, y)
         if action_space is not None and hasattr(action_space, "shape") and len(action_space.shape) > 0:
             env_dim = int(np.prod(action_space.shape))
-            # Only override if reasonable (e.g. gym box 2D), not dataset 100D
             if env_dim <= 10:
                 self._single_action_dim = env_dim
 
@@ -98,13 +94,6 @@ class ExplicitGradientSolver:
             self._action_dim = int(encoder_in_dim)
         else:
             self._action_dim = self._single_action_dim * self._action_block
-
-        print(
-            f"ExplicitGradientSolver re-configured: raw_action_dim={self._single_action_dim}, "
-            f"action_block={self._action_block}, "
-            f"optimized_action_dim={self._action_dim}, "
-            f"horizon={self._horizon}"
-        )
 
     @property
     def n_envs(self):
@@ -142,11 +131,22 @@ class ExplicitGradientSolver:
             return torch.from_numpy(value).to(self.device)
         return value
 
+    def _slice_info_dict(self, info_dict: dict, idx: int) -> dict:
+        """Extract a single episode context (batch size = 1) from the batch info_dict."""
+        sliced = {}
+        for k, v in info_dict.items():
+            if torch.is_tensor(v) or isinstance(v, np.ndarray):
+                sliced[k] = v[idx : idx + 1]
+            elif isinstance(v, (list, tuple)) and len(v) > idx:
+                sliced[k] = [v[idx]]
+            else:
+                sliced[k] = v
+        return sliced
+
     def _adapt_action_tensor(self, x: torch.Tensor) -> torch.Tensor:
-        """Adapts an incoming action tensor (whether 2D, chunked, or flat) to self._action_dim."""
         x = x.to(self.device)
         if x.ndim == 2:
-            x = x.unsqueeze(1)  # (B, D) -> (B, 1, D)
+            x = x.unsqueeze(1)
         elif x.ndim != 3:
             raise ValueError(f"Expected action tensor with shape (B, D) or (B, T, D), got {tuple(x.shape)}")
 
@@ -156,12 +156,10 @@ class ExplicitGradientSolver:
         if current_feat == target_feat:
             return x
 
-        # If it's a raw 2D PushT action, tile it up to the model's expected dimension
         if target_feat % current_feat == 0:
             repeat_factor = target_feat // current_feat
             return x.repeat(1, 1, repeat_factor)
 
-        # Fallback: slice or zero-pad if there's a structural mismatch
         if current_feat > target_feat:
             return x[..., :target_feat]
         else:
@@ -169,9 +167,7 @@ class ExplicitGradientSolver:
             return torch.cat([x, pad], dim=-1)
 
     def _build_context(self, info_dict: dict) -> dict:
-        """Build the context dictionary used by model.encode()."""
         context = {}
-
         ignored = {
             "goal",
             "goal_pixels",
@@ -202,7 +198,6 @@ class ExplicitGradientSolver:
         return context
 
     def _build_goal(self, info_dict: dict) -> dict:
-        """Build the goal dictionary used by model.encode()."""
         if "goal" not in info_dict:
             raise KeyError("Evaluation info_dict must contain a 'goal' key")
 
@@ -217,7 +212,6 @@ class ExplicitGradientSolver:
         return goal
 
     def _normalized_bounds(self):
-        """Convert raw action bounds to normalized space."""
         if self.action_bounds is None or "action" not in self.process:
             return None
 
@@ -289,15 +283,9 @@ class ExplicitGradientSolver:
         return actions
 
     # ---------------------------------------------------------------------
-    # Explicit latent objective
+    # Latent objective for a single sequence
     # ---------------------------------------------------------------------
-    def _latent_energy(
-        self,
-        context_data: dict,
-        goal_data: dict,
-        act_seq: torch.Tensor,
-        return_per_env: bool = False,
-    ):
+    def _latent_energy(self, context_data: dict, goal_data: dict, act_seq: torch.Tensor):
         with torch.no_grad():
             ctx_output = self.model.encode(context_data)
             ctx_emb = ctx_output["emb"]
@@ -331,29 +319,25 @@ class ExplicitGradientSolver:
             final_pred_emb = pred_emb
 
         sq_error = (final_pred_emb - goal_emb.detach()).pow(2)
-        energy = sq_error.mean()
+        return sq_error.mean()
 
-        if return_per_env:
-            per_env_mse = sq_error.flatten(start_dim=1).mean(dim=1)
-            return energy, per_env_mse.detach()
-
-        return energy
-
-    def solve(self, info_dict: dict, init_action: torch.Tensor | None = None) -> dict:
-        start_time = time.time()
-
-        first = self._first_tensor(info_dict)
-        batch_size = len(first)
-
-        context = self._build_context(info_dict)
-        goal = self._build_goal(info_dict)
-
-        actions = self._initial_action(batch_size, init_action)
+    # ---------------------------------------------------------------------
+    # Sequential Optimizer
+    # ---------------------------------------------------------------------
+    def _optimize_single_episode(
+        self,
+        ep_info: dict,
+        ep_init_action: torch.Tensor | None,
+        bounds: tuple | None,
+    ) -> tuple[torch.Tensor, list[float]]:
+        """Run gradient descent planning for one single episode."""
+        context = self._build_context(ep_info)
+        goal = self._build_goal(ep_info)
+        actions = self._initial_action(batch_size=1, init_action=ep_init_action)
 
         energy_history = []
-        bounds = self._normalized_bounds()
 
-        for step in range(self.n_steps):
+        for _ in range(self.n_steps):
             energy = self._latent_energy(context, goal, actions)
 
             grad_energy = torch.autograd.grad(
@@ -369,9 +353,7 @@ class ExplicitGradientSolver:
                 if self.grad_clip is not None:
                     grad_norm = grad_energy.norm()
                     if grad_norm > self.grad_clip:
-                        grad_energy = grad_energy * (
-                            self.grad_clip / (grad_norm + 1e-6)
-                        )
+                        grad_energy = grad_energy * (self.grad_clip / (grad_norm + 1e-6))
 
                 actions -= self.lr * grad_energy
 
@@ -389,11 +371,20 @@ class ExplicitGradientSolver:
 
             actions.requires_grad_(True)
 
-        final_energy, final_per_env_mse = self._latent_energy(
-            context, goal, actions, return_per_env=True
-        )
+        final_energy = self._latent_energy(context, goal, actions)
         energy_history.append(float(final_energy.detach().cpu().item()))
 
+        return actions.detach().cpu(), energy_history
+
+    def solve(self, info_dict: dict, init_action: torch.Tensor | None = None) -> dict:
+        start_time = time.time()
+
+        first = self._first_tensor(info_dict)
+        batch_size = len(first)
+
+        bounds = self._normalized_bounds()
+
+        # Parse episode identifiers for logging
         episode_ids = None
         for key in ("episode_idx", "ep_idx"):
             if key in info_dict:
@@ -406,28 +397,41 @@ class ExplicitGradientSolver:
                     episode_ids = list(value)
                 break
 
-        print("\nFINAL LATENT MSE AFTER OPTIMIZATION")
-        print("----------------------------------")
-        for env_i, mse in enumerate(final_per_env_mse.cpu().tolist()):
+        gathered_actions = []
+        all_final_mses = []
+        full_cost_traces = []
+
+        print(f"\nRunning sequential optimization across {batch_size} episodes...")
+
+        for i in range(batch_size):
+            ep_info = self._slice_info_dict(info_dict, i)
+            ep_init = init_action[i : i + 1] if init_action is not None else None
+
+            opt_action, cost_trace = self._optimize_single_episode(ep_info, ep_init, bounds)
+
+            gathered_actions.append(opt_action)
+            all_final_mses.append(cost_trace[-1])
+            full_cost_traces.append(cost_trace)
+
             ep_label = (
-                episode_ids[env_i]
-                if episode_ids is not None and env_i < len(episode_ids)
-                else env_i
+                episode_ids[i]
+                if episode_ids is not None and i < len(episode_ids)
+                else i
             )
-            print(f"Episode {ep_label}: final_MSE={mse:.8f}")
-        print(f"Batch mean final MSE: {final_energy.item():.8f}")
+            print(f"  [Episode {ep_label}] final_MSE={cost_trace[-1]:.8f}")
 
-        actions_out = actions.detach().cpu()
+        # Stack batch back into (B, horizon, action_dim) for WorldModelPolicy
+        actions_out = torch.cat(gathered_actions, dim=0)
 
+        mean_cost_trace = np.mean(full_cost_traces, axis=0).tolist()
         elapsed = time.time() - start_time
-        print(
-            f"ExplicitGradientSolver.solve completed in {elapsed:.4f}s "
-            f"(final latent MSE={energy_history[-1]:.6f})."
-        )
+
+        print(f"Batch mean final MSE: {np.mean(all_final_mses):.8f}")
+        print(f"ExplicitGradientSolver.solve completed sequentially in {elapsed:.4f}s\n")
 
         return {
             "actions": actions_out,
-            "cost": energy_history,
+            "cost": mean_cost_trace,
         }
 
 
@@ -566,7 +570,7 @@ def run(cfg: DictConfig):
     )
 
     # ------------------------------------------------------------------
-    # Select valid evaluation starting points.
+    # Select valid evaluation starting points
     # ------------------------------------------------------------------
     episode_len = get_episodes_length(dataset, ep_indices)
     max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
@@ -600,7 +604,7 @@ def run(cfg: DictConfig):
         raise ValueError("Not enough episodes with sufficient length for evaluation.")
 
     # ------------------------------------------------------------------
-    # Evaluate with the normal stable-worldmodel environment loop.
+    # Evaluate with the normal stable-worldmodel environment loop
     # ------------------------------------------------------------------
     world.set_policy(policy)
     results_path.mkdir(parents=True, exist_ok=True)
@@ -634,7 +638,7 @@ def run(cfg: DictConfig):
         f.write(f"metrics: {metrics}\n")
         f.write(f"evaluation_time: {end_time - start_time} seconds\n")
         f.write(
-            "planner: ExplicitGradientSolver; "
+            "planner: ExplicitGradientSolver (Sequential); "
             "objective: mean((final_pred_emb - goal_emb)^2); "
             "gradient: torch.autograd.grad\n"
         )
