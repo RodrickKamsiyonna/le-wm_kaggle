@@ -13,701 +13,228 @@ from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
+from stable_worldmodel.solver.gd import GradientSolver
 
 # ---------------------------------------------------------------------------
-# Explicit gradient planner (Sequential / One-by-One)
+# PATCH: stable-worldmodel 0.1.1 bug — GradientSolver.init_action() /
+# prepare_init_action() leave the warm-start action tensor on CPU on the
+# very first planning call, causing:
+#   RuntimeError: Expected all tensors to be on the same device, but found
+#   at least two devices, cuda:0 and cpu!
+#
+# Root cause: when solve() is first called, init_action=None. In
+# prepare_init_action() (solver/utils.py), for a non-Actionable model this
+# branch runs:
+#     device = init_action.device if init_action is not None else 'cpu'
+# which hardcodes 'cpu' regardless of the solver's configured device, and
+# returns a full-horizon action tensor on CPU.
+#
+# Back in GradientSolver.init_action() (solver/gd.py), the only line that
+# moves `actions` to self.device is inside `if remaining > 0: ...`. Since
+# the tensor returned above already covers the full horizon, remaining == 0,
+# so that branch — and the device move — is skipped. The CPU actions tensor
+# is then combined in-place with a CUDA tensor from torch.randn(...,
+# device=self.device), which crashes.
+#
+# Fix: same as the original init_action, but always call actions.to(self.device)
+# right before use, not just inside the "remaining > 0" branch.
 # ---------------------------------------------------------------------------
-class ExplicitGradientSolver:
-    """Gradient-descent planner running per-episode sequential optimization."""
-
-    def __init__(
-        self,
-        model,
-        n_steps: int,
-        device: str | torch.device = "cuda",
-        lr: float = 1.0,
-        action_noise: float = 0.0,
-        grad_clip: float | None = None,
-        seed: int = 1234,
-        process: dict | None = None,
-        action_bounds=None,
-        action_block: int = 5,
-        horizon: int = 5,
-        raw_action_dim: int = 2,
-    ):
-        self.model = model
-        self.n_steps = int(n_steps)
-        self.device = torch.device(device)
-        self.lr = float(lr)
-        self.action_noise = float(action_noise)
-        self.grad_clip = grad_clip
-        self.process = process or {}
-        self.action_bounds = action_bounds
-
-        self.generator = torch.Generator(device=self.device).manual_seed(seed)
-        self._action_block = int(action_block)
-        self._horizon = int(horizon)
-        self._single_action_dim = int(raw_action_dim)
-
-        self._action_dim = self._infer_action_encoder_dim() or (
-            self._single_action_dim * self._action_block
-        )
-
-        self._n_envs = None
-        self._configured = True
-        self._dtype = torch.float32
-
-        try:
-            self._dtype = next(model.parameters()).dtype
-        except (AttributeError, StopIteration):
-            pass
-
-        print(
-            f"ExplicitGradientSolver initialized (Sequential Mode): raw_action_dim={self._single_action_dim}, "
-            f"action_block={self._action_block}, "
-            f"optimized_action_dim={self._action_dim}, "
-            f"horizon={self._horizon}"
-        )
-
-    def configure(self, *, action_space=None, n_envs: int = 1, config=None, **kwargs):
-        self._configured = True
-        if n_envs is not None:
-            self._n_envs = int(n_envs)
-        if config is not None:
-            if hasattr(config, "action_block"):
-                self._action_block = int(config.action_block)
-            if hasattr(config, "horizon"):
-                self._horizon = int(config.horizon)
-
-        known_action_dim = self._infer_action_encoder_dim()
-
-        if action_space is not None and hasattr(action_space, "shape") and len(action_space.shape) > 0:
-            env_dim = int(np.prod(action_space.shape))
-            macro_dim = known_action_dim or (self._single_action_dim * self._action_block)
-            if env_dim == self._single_action_dim:
-                pass
-            elif env_dim > 0 and macro_dim % env_dim == 0:
-                self._single_action_dim = env_dim
-            else:
-                print(
-                    f"[ExplicitGradientSolver] Warning: env action_space reports dim={env_dim}, "
-                    f"which is inconsistent with this model's macro-action dim ({macro_dim}). "
-                    f"Keeping raw_action_dim={self._single_action_dim}."
-                )
-
-        self._action_dim = known_action_dim or (self._single_action_dim * self._action_block)
-
-    def _infer_action_encoder_dim(self):
-        action_encoder = getattr(self.model, "action_encoder", None)
-        if action_encoder is None:
-            return None
-        patch_embed = getattr(action_encoder, "patch_embed", None)
-        in_channels = getattr(patch_embed, "in_channels", None) if patch_embed is not None else None
-        if in_channels is None:
-            return None
-
-        in_channels = int(in_channels)
-        guessed = self._single_action_dim * self._action_block
-        if in_channels != guessed:
-            print(
-                f"[ExplicitGradientSolver] Warning: action_encoder expects {in_channels}-dim actions, "
-                f"but raw_action_dim * action_block = {guessed}. Using model's real value."
-            )
-        return in_channels
-
-    @property
-    def n_envs(self):
-        return self._n_envs
-
-    @property
-    def action_dim(self):
-        return self._action_dim
-
-    @property
-    def horizon(self):
-        return self._horizon
-
-    @property
-    def dtype(self):
-        return self._dtype
-
-    def __call__(self, *args, **kwargs):
-        return self.solve(*args, **kwargs)
-
-    # ---------------------------------------------------------------------
-    # Helpers
-    # ---------------------------------------------------------------------
-    @staticmethod
-    def _first_tensor(info_dict: dict) -> torch.Tensor:
-        for value in info_dict.values():
-            if torch.is_tensor(value):
-                return value
-        raise ValueError("info_dict contains no tensor values")
-
-    def _move_to_device(self, value):
-        if torch.is_tensor(value):
-            return value.to(self.device)
-        if isinstance(value, np.ndarray):
-            return torch.from_numpy(value).to(self.device)
-        return value
-
-    def _slice_info_dict(self, info_dict: dict, idx: int) -> dict:
-        sliced = {}
-        for k, v in info_dict.items():
-            if torch.is_tensor(v) or isinstance(v, np.ndarray):
-                sliced[k] = v[idx : idx + 1]
-            elif isinstance(v, (list, tuple)) and len(v) > idx:
-                sliced[k] = [v[idx]]
-            else:
-                sliced[k] = v
-        return sliced
-
-    # --- ENHANCEMENT 3: Explicit Action Normalization ---
-    def normalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        """Standardize action tensor using precomputed dataset statistics prior to model rollout."""
-        if "action" not in self.process:
-            return actions
-
-        scaler = self.process["action"]
-        mean = torch.as_tensor(scaler.mean_, device=actions.device, dtype=actions.dtype)
-        scale = torch.as_tensor(scaler.scale_, device=actions.device, dtype=actions.dtype)
-
-        # Tile scaler parameters if scaler is per-step (raw_action_dim) but actions are macro-actions
-        if mean.shape[-1] == self._single_action_dim and actions.shape[-1] == self._action_dim:
-            repeat_factor = self._action_dim // self._single_action_dim
-            mean = mean.repeat(repeat_factor)
-            scale = scale.repeat(repeat_factor)
-
-        if mean.shape[-1] == actions.shape[-1]:
-            return (actions - mean) / (scale + 1e-8)
-
-        return actions
-
-    def _adapt_action_tensor(self, x: torch.Tensor, *, allow_grouping: bool = False) -> torch.Tensor:
-        x = x.to(self.device)
-        if x.ndim == 2:
-            x = x.unsqueeze(1)
-        elif x.ndim != 3:
-            raise ValueError(f"Expected action tensor with shape (B, D) or (B, T, D), got {tuple(x.shape)}")
-
-        current_feat = x.shape[-1]
-        target_feat = self._action_dim
-
-        if current_feat == target_feat:
-            return x
-
-        if (
-            allow_grouping
-            and current_feat == self._single_action_dim
-            and target_feat % current_feat == 0
-        ):
-            block = target_feat // current_feat
-            b, t, d = x.shape
-            drop = t % block
-            if drop != 0:
-                print(
-                    f"[ExplicitGradientSolver] Warning: action_history length {t} is not divisible "
-                    f"by action_block={block}; dropping the oldest {drop} step(s)."
-                )
-                x = x[:, drop:]
-                t -= drop
-            return x.reshape(b, t // block, d * block)
-
-        if target_feat % current_feat == 0:
-            repeat_factor = target_feat // current_feat
-            return x.repeat(1, 1, repeat_factor)
-
-        if current_feat > target_feat:
-            return x[..., :target_feat]
-        else:
-            pad = torch.zeros(*x.shape[:-1], target_feat - current_feat, device=x.device, dtype=x.dtype)
-            return torch.cat([x, pad], dim=-1)
-
-    def _build_context(self, info_dict: dict) -> dict:
-        context = {}
-        ignored = {
-            "goal",
-            "goal_pixels",
-            "terminated",
-            "truncated",
-            "_needs_flush",
-            "action_history",
-            "action",
-        }
-
-        for key, value in info_dict.items():
-            if key not in ignored:
-                context[key] = self._move_to_device(value)
-
-        if "action_history" in info_dict:
-            hist = self._move_to_device(info_dict["action_history"])
-            hist = self._adapt_action_tensor(hist, allow_grouping=True)
-
-            current = info_dict.get("action")
-            if current is not None and torch.is_tensor(current):
-                current = self._adapt_action_tensor(current)
-                merged = torch.cat([hist, current], dim=1)
-            else:
-                merged = hist
-
-            # Normalize action context prior to feeding to the model
-            context["action"] = self.normalize_actions(merged)
-
-        elif "action" in info_dict and torch.is_tensor(info_dict["action"]):
-            context["action"] = self.normalize_actions(
-                self._adapt_action_tensor(info_dict["action"])
-            )
-
-        return context
-
-    def _build_goal(self, info_dict: dict) -> dict:
-        if "goal" not in info_dict:
-            raise KeyError("Evaluation info_dict must contain a 'goal' key")
-
-        goal = {
-            "pixels": self._move_to_device(info_dict["goal"]),
-        }
-
-        for key, value in info_dict.items():
-            if key.startswith("goal_") and key != "goal_pixels":
-                goal[key] = self._move_to_device(value)
-
-        return goal
-
-    def _normalized_bounds(self):
-        if self.action_bounds is None or "action" not in self.process:
-            return None
-
-        scaler = self.process["action"]
-        scaler_dim = int(scaler.mean_.shape[0])
-
-        raw_lo, raw_hi = self.action_bounds
-        raw_lo = np.asarray(raw_lo, dtype=np.float32)
-        raw_hi = np.asarray(raw_hi, dtype=np.float32)
-
-        if scaler_dim == self._single_action_dim:
-            if raw_lo.ndim == 0:
-                raw_lo = np.full((self._single_action_dim,), raw_lo.item(), dtype=np.float32)
-            if raw_hi.ndim == 0:
-                raw_hi = np.full((self._single_action_dim,), raw_hi.item(), dtype=np.float32)
-
-            lo = scaler.transform(raw_lo.reshape(1, -1))[0]
-            hi = scaler.transform(raw_hi.reshape(1, -1))[0]
-
-            repeat_factor = max(1, self._action_dim // self._single_action_dim)
-            lo = np.tile(lo, repeat_factor)[: self._action_dim]
-            hi = np.tile(hi, repeat_factor)[: self._action_dim]
-            return torch.as_tensor(lo, device=self.device, dtype=self.dtype), torch.as_tensor(
-                hi, device=self.device, dtype=self.dtype
-            )
-
-        return None
-
-    def _initial_action(self, batch_size: int, init_action: torch.Tensor | None):
-        if init_action is None:
-            # Standard Gaussian initialized directly in normalized latent space
-            actions = torch.randn(
-                batch_size,
-                self.horizon,
-                self.action_dim,
-                device=self.device,
-                dtype=self.dtype,
-                generator=self.generator,
-                requires_grad=True,
-            )
-        else:
-            actions = init_action.to(device=self.device, dtype=self.dtype).clone().detach()
-
-            if actions.ndim == 4:
-                actions = actions[:, 0]
-
-            if actions.shape[-1] != self.action_dim:
-                actions = self._adapt_action_tensor(actions)
-
-            if actions.shape[1] < self.horizon:
-                pad = torch.zeros(
-                    batch_size,
-                    self.horizon - actions.shape[1],
-                    self.action_dim,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-                actions = torch.cat([actions, pad], dim=1)
-            elif actions.shape[1] > self.horizon:
-                actions = actions[:, : self.horizon]
-
-            # Normalize warm-start actions prior to optimization
-            actions = self.normalize_actions(actions)
-            actions.requires_grad_(True)
-
-        bounds = self._normalized_bounds()
-        if bounds is not None:
-            lo, hi = bounds
-            with torch.no_grad():
-                actions.clamp_(lo, hi)
-
-        return actions
-
-    # ---------------------------------------------------------------------
-    # Latent objective for a single sequence
-    # ---------------------------------------------------------------------
-    def _encode_context_and_goal(self, context_data: dict, goal_data: dict):
-        with torch.no_grad():
-            ctx_output = self.model.encode(context_data)
-            goal_output = self.model.encode(goal_data)
-        return ctx_output["emb"], ctx_output["act_emb"], goal_output["emb"][:, -1]
-
-    def _latent_energy(self, ctx_emb, ctx_act, goal_emb, act_seq: torch.Tensor):
-        act_emb_seq = self.model.action_encoder(act_seq)
-
-        current_ctx_emb = ctx_emb
-        current_ctx_act = ctx_act
-        final_pred_emb = None
-
-        for t in range(self.horizon):
-            step_act_emb = act_emb_seq[:, t : t + 1]
-
-            full_act_ctx = torch.cat(
-                [current_ctx_act[:, 1:], step_act_emb],
-                dim=1,
-            )
-
-            pred_out = self.model.predict(current_ctx_emb, full_act_ctx)
-            pred_emb = pred_out[:, -1] if pred_out.dim() == 3 else pred_out
-
-            current_ctx_emb = torch.cat(
-                [current_ctx_emb[:, 1:], pred_emb.unsqueeze(1)],
-                dim=1,
-            )
-            current_ctx_act = full_act_ctx
-            final_pred_emb = pred_emb
-
-        sq_error = (final_pred_emb - goal_emb.detach()).pow(2)
-        return sq_error.mean()
-
-    # ---------------------------------------------------------------------
-    # Sequential Optimizer
-    # ---------------------------------------------------------------------
-    def _optimize_single_episode(
-        self,
-        ep_info: dict,
-        ep_init_action: torch.Tensor | None,
-        bounds: tuple | None,
-    ) -> tuple[torch.Tensor, list[float]]:
-        """Run gradient descent planning for one single episode."""
-        context = self._build_context(ep_info)
-        goal = self._build_goal(ep_info)
-        actions = self._initial_action(batch_size=1, init_action=ep_init_action)
-
-        ctx_emb, ctx_act, goal_emb = self._encode_context_and_goal(context, goal)
-
-        energy_history = []
-
-        for step_idx in range(self.n_steps):
-            energy = self._latent_energy(ctx_emb, ctx_act, goal_emb, actions)
-
-            grad_energy = torch.autograd.grad(
-                energy,
-                actions,
-                create_graph=False,
-                retain_graph=False,
-            )[0]
-
-            energy_history.append(float(energy.detach().cpu().item()))
-
-            with torch.no_grad():
-                if self.grad_clip is not None:
-                    grad_norm = grad_energy.norm()
-                    if grad_norm > self.grad_clip:
-                        grad_energy = grad_energy * (self.grad_clip / (grad_norm + 1e-6))
-
-                # Gradient descent step
-                actions -= self.lr * grad_energy
-
-                # --- ENHANCEMENT 1: Langevin-Style Perturbation Noise ---
-                # Add Gaussian perturbation during optimization to escape local minima
-                if self.action_noise > 0.0 and step_idx < (self.n_steps - 1):
-                    noise = torch.randn(
-                        actions.shape,
-                        device=self.device,
-                        dtype=self.dtype,
-                        generator=self.generator,
-                    )
-                    actions += self.action_noise * noise
-
-                if bounds is not None:
-                    lo, hi = bounds
-                    actions.clamp_(lo, hi)
-
-            actions.requires_grad_(True)
-
-        final_energy = self._latent_energy(ctx_emb, ctx_act, goal_emb, actions)
-        energy_history.append(float(final_energy.detach().cpu().item()))
-
-        return actions.detach().cpu(), energy_history
-
-    def solve(self, info_dict: dict, init_action: torch.Tensor | None = None) -> dict:
-        start_time = time.time()
-
-        first = self._first_tensor(info_dict)
-        batch_size = len(first)
-
-        bounds = self._normalized_bounds()
-
-        episode_ids = None
-        for key in ("episode_idx", "ep_idx"):
-            if key in info_dict:
-                value = info_dict[key]
-                if torch.is_tensor(value):
-                    episode_ids = value.detach().cpu().reshape(-1).tolist()
-                elif isinstance(value, np.ndarray):
-                    episode_ids = value.reshape(-1).tolist()
-                elif isinstance(value, (list, tuple)):
-                    episode_ids = list(value)
-                break
-
-        gathered_actions = []
-        all_final_mses = []
-        full_cost_traces = []
-
-        print(f"\nRunning sequential optimization across {batch_size} episodes...")
-
-        for i in range(batch_size):
-            ep_info = self._slice_info_dict(info_dict, i)
-            ep_init = init_action[i : i + 1] if init_action is not None else None
-
-            opt_action, cost_trace = self._optimize_single_episode(ep_info, ep_init, bounds)
-
-            gathered_actions.append(opt_action)
-            all_final_mses.append(cost_trace[-1])
-            full_cost_traces.append(cost_trace)
-
-            ep_label = (
-                episode_ids[i]
-                if episode_ids is not None and i < len(episode_ids)
-                else i
-            )
-            print(f"  [Episode {ep_label}] final_MSE={cost_trace[-1]:.8f}")
-
-        actions_out = torch.cat(gathered_actions, dim=0)
-
-        mean_cost_trace = np.mean(full_cost_traces, axis=0).tolist()
-        elapsed = time.time() - start_time
-
-        print(f"Batch mean final MSE: {np.mean(all_final_mses):.8f}")
-        print(f"ExplicitGradientSolver.solve completed sequentially in {elapsed:.4f}s\n")
-
-        return {
-            "actions": actions_out,
-            "cost": mean_cost_trace,
-        }
-
-
-# ---------------------------------------------------------------------------
-# Standard preprocessing / dataset helpers
-# ---------------------------------------------------------------------------
-def img_transform(cfg):
-    transform = transforms.Compose(
-        [
-            transforms.ToImage(),
-            transforms.ToDtype(torch.float32, scale=True),
-            transforms.Normalize(**spt.data.dataset_stats.ImageNet),
-            transforms.Resize(size=cfg.eval.img_size),
-        ]
+def _patched_init_action(self, n_envs, actions=None):
+    if actions is None:
+        actions = torch.zeros((n_envs, 0, self.action_dim), dtype=self.dtype)
+
+    remaining = self.horizon - actions.shape[1]
+    if remaining > 0:
+        new_actions = torch.zeros(n_envs, remaining, self.action_dim, dtype=self.dtype)
+        actions = torch.cat([actions, new_actions], dim=1)
+
+    actions = actions.to(self.device)  # <-- always move, not just when padding was needed
+    actions = actions.unsqueeze(1).repeat_interleave(self.num_samples, dim=1)
+    actions[:, 1:] += (
+    torch.randn(
+        actions[:, 1:].shape,
+        generator=self.torch_gen,
+        device=self.device,
+        dtype=self.dtype,
     )
-    return transform
+    * 0.1)
+    if hasattr(self, "init") and self.init.shape == actions.shape:
+        self.init.copy_(actions)
+    else:
+        if "init" in self._parameters:
+            del self._parameters["init"]
+        self.register_parameter("init", torch.nn.Parameter(actions))
+
+
+GradientSolver.init_action = _patched_init_action
+# ---------------------------------------------------------------------------
+
+
+def img_transform(cfg):
+    transform = transforms.Compose(
+        [
+            transforms.ToImage(),
+            transforms.ToDtype(torch.float32, scale=True),
+            transforms.Normalize(**spt.data.dataset_stats.ImageNet),
+            transforms.Resize(size=cfg.eval.img_size),
+        ]
+    )
+    return transform
 
 
 def get_episodes_length(dataset, episodes):
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
+    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
 
-    episode_idx = dataset.get_col_data(col_name)
-    step_idx = dataset.get_col_data("step_idx")
-    lengths = []
-    for ep_id in episodes:
-        lengths.append(np.max(step_idx[episode_idx == ep_id]) + 1)
-    return np.array(lengths)
+    episode_idx = dataset.get_col_data(col_name)
+    step_idx = dataset.get_col_data("step_idx")
+    lengths = []
+    for ep_id in episodes:
+        lengths.append(np.max(step_idx[episode_idx == ep_id]) + 1)
+    return np.array(lengths)
 
 
 def get_dataset(cfg, dataset_name):
-    dataset_path = Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
-    dataset = swm.data.HDF5Dataset(
-        dataset_name,
-        keys_to_cache=cfg.dataset.keys_to_cache,
-        cache_dir=dataset_path,
-    )
-    return dataset
+    dataset_path = Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
+    dataset = swm.data.HDF5Dataset(
+        dataset_name,
+        keys_to_cache=cfg.dataset.keys_to_cache,
+        cache_dir=dataset_path,
+    )
+    return dataset
 
-
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
-    """Run PushT evaluation with explicit latent gradient descent planning."""
+    """Run evaluation of dinowm vs random policy."""
+    assert (
+        cfg.plan_config.horizon * cfg.plan_config.action_block <= cfg.eval.eval_budget
+    ), "Planning horizon must be smaller than or equal to eval_budget"
 
-    assert (
-        cfg.plan_config.horizon * cfg.plan_config.action_block <= cfg.eval.eval_budget
-    ), "Planning horizon must be smaller than or equal to eval_budget"
+    # create world environment
+    cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
+    world = swm.World(**cfg.world, image_shape=(224, 224))
 
-    cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
-    world = swm.World(**cfg.world, image_shape=(224, 224))
+    # create the transform
+    transform = {
+        "pixels": img_transform(cfg),
+        "goal": img_transform(cfg),
+    }
 
-    transform = {
-        "pixels": img_transform(cfg),
-        "goal": img_transform(cfg),
-    }
+    dataset = get_dataset(cfg, cfg.eval.dataset_name)
+    stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
+    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
+    ep_indices, _ = np.unique(stats_dataset.get_col_data(col_name), return_index=True)
 
-    dataset = get_dataset(cfg, cfg.eval.dataset_name)
-    stats_dataset = dataset
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
-    ep_indices, _ = np.unique(
-        stats_dataset.get_col_data(col_name), return_index=True
-    )
+    process = {}
+    for col in cfg.dataset.keys_to_cache:
+        if col in ["pixels"]:
+            continue
+        processor = preprocessing.StandardScaler()
+        col_data = stats_dataset.get_col_data(col)
+        col_data = col_data[~np.isnan(col_data).any(axis=1)]
+        processor.fit(col_data)
+        process[col] = processor
 
-    process = {}
-    for col in cfg.dataset.keys_to_cache:
-        if col == "pixels":
-            continue
+        if col != "action":
+            process[f"goal_{col}"] = process[col]
 
-        processor = preprocessing.StandardScaler()
-        col_data = stats_dataset.get_col_data(col)
-        if col_data.ndim == 1:
-            col_data = col_data.reshape(-1, 1)
-        col_data = col_data[~np.isnan(col_data).any(axis=1)]
-        processor.fit(col_data)
-        process[col] = processor
+    # -- run evaluation
+    policy = cfg.get("policy", "random")
 
-        if col != "action":
-            process[f"goal_{col}"] = process[col]
+    if policy != "random":
+        
+        ckpt_path = cfg.policy 
+        if not ckpt_path.endswith(".ckpt"):
+            ckpt_path += ".ckpt"  # Ensure it looks for a .ckpt file
+            
+        print(f"Loading local PyTorch model from {ckpt_path}...")
+        model = torch.load(ckpt_path, map_location="cpu", weights_only=False)        
+        
+        # --- FIX 1: Explicitly move the model to the GPU ---
+        model = model.to("cuda")
+        
+        model = model.eval()
+        model.requires_grad_(False)
+        model.interpolate_pos_encoding = True
+        config = swm.PlanConfig(**cfg.plan_config)
+        solver = hydra.utils.instantiate(cfg.solver, model=model, device="cuda")
+                    
+        policy = swm.policy.WorldModelPolicy(
+            solver=solver, 
+            config=config, 
+            process=process, 
+            transform=transform,
+        )
+    else:
+        policy = swm.policy.RandomPolicy()
 
-    policy_name = cfg.get("policy", "random")
+    results_path = (
+        Path(swm.data.utils.get_cache_dir(), cfg.policy).parent
+        if cfg.policy != "random"
+        else Path(__file__).parent
+    )
 
-    if policy_name == "random":
-        policy = swm.policy.RandomPolicy()
-        ckpt_path = None
-    else:
-        ckpt_path = policy_name
-        if not ckpt_path.endswith(".ckpt"):
-            ckpt_path += ".ckpt"
+    # sample the episodes and the starting indices
+    episode_len = get_episodes_length(dataset, ep_indices)
+    max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
+    max_start_idx_dict = {ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)}
+    # Map each dataset row’s episode_idx to its max_start_idx
+    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
+    max_start_per_row = np.array(
+        [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
+    )
 
-        print(f"Loading local PyTorch model from {ckpt_path}...")
-        model = torch.load(
-            ckpt_path,
-            map_location="cpu",
-            weights_only=False,
-        )
+    # remove all the lines of dataset for which dataset['step_idx'] > max_start_per_row
+    valid_mask = dataset.get_col_data("step_idx") <= max_start_per_row
+    valid_indices = np.nonzero(valid_mask)[0]
+    print(valid_mask.sum(), "valid starting points found for evaluation.")
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {device}")
+    g = np.random.default_rng(cfg.seed)
+    random_episode_indices = g.choice(
+        len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False
+    )
 
-        model = model.to(device)
-        model = model.eval()
-        model.requires_grad_(False)
-        model.interpolate_pos_encoding = True
+    # sort increasingly to avoid issues with HDF5Dataset indexing
+    random_episode_indices = np.sort(valid_indices[random_episode_indices])
 
-        config = swm.PlanConfig(**cfg.plan_config)
+    print(random_episode_indices)
 
-        solver_cfg = cfg.get("solver", cfg.get("gradient_solver", {}))
-        optimizer_kwargs = solver_cfg.get("optimizer_kwargs", {})
-        lr = float(optimizer_kwargs.get("lr", 1.0))
+    eval_episodes = dataset.get_row_data(random_episode_indices)[col_name]
+    eval_start_idx = dataset.get_row_data(random_episode_indices)["step_idx"]
 
-        explicit_solver = ExplicitGradientSolver(
-            model=model,
-            n_steps=int(solver_cfg.get("n_steps", 50)),
-            device=device,
-            lr=lr,
-            action_noise=float(solver_cfg.get("action_noise", 0.0)),
-            grad_clip=solver_cfg.get("grad_clip", None),
-            seed=int(cfg.get("seed", 1234)),
-            process=process,
-            action_bounds=solver_cfg.get("action_bounds", None),
-            action_block=int(cfg.plan_config.action_block),
-            horizon=int(cfg.plan_config.horizon),
-            raw_action_dim=2,
-        )
+    if len(eval_episodes) < cfg.eval.num_eval:
+        raise ValueError("Not enough episodes with sufficient length for evaluation.")
 
-        policy = swm.policy.WorldModelPolicy(
-            solver=explicit_solver,
-            config=config,
-            process=process,
-            transform=transform,
-        )
+    world.set_policy(policy)
+    results_path.mkdir(parents=True, exist_ok=True)
 
-    results_path = (
-        Path(ckpt_path).resolve().parent
-        if policy_name != "random"
-        else Path(__file__).parent
-    )
+    start_time = time.time()
+    metrics = world.evaluate(
+        dataset=dataset,
+        start_steps=eval_start_idx.tolist(),
+        goal_offset=cfg.eval.goal_offset_steps,
+        eval_budget=cfg.eval.eval_budget,
+        episodes_idx=eval_episodes.tolist(),
+        callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True),
+        video=results_path,
+    )
+    end_time = time.time()
+        
+    print(metrics)
 
-    episode_len = get_episodes_length(dataset, ep_indices)
-    max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
-    max_start_idx_dict = {
-        ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)
-    }
+    results_path = results_path / cfg.output.filename
+    results_path.parent.mkdir(parents=True, exist_ok=True)
 
-    max_start_per_row = np.array(
-        [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
-    )
+    with results_path.open("a") as f:
+        f.write("\n")  # separate from previous runs
 
-    valid_mask = dataset.get_col_data("step_idx") <= max_start_per_row
-    valid_indices = np.nonzero(valid_mask)[0]
-    print(valid_mask.sum(), "valid starting points found for evaluation.")
+        f.write("==== CONFIG ====\n")
+        f.write(OmegaConf.to_yaml(cfg))
+        f.write("\n")
 
-    g = np.random.default_rng(cfg.seed)
-    random_episode_indices = g.choice(
-        len(valid_indices),
-        size=cfg.eval.num_eval,
-        replace=False,
-    )
-
-    random_episode_indices = np.sort(valid_indices[random_episode_indices])
-    print(random_episode_indices)
-
-    eval_rows = dataset.get_row_data(random_episode_indices)
-    eval_episodes = eval_rows[col_name]
-    eval_start_idx = eval_rows["step_idx"]
-
-    if len(eval_episodes) < cfg.eval.num_eval:
-        raise ValueError("Not enough episodes with sufficient length for evaluation.")
-
-    world.set_policy(policy)
-    results_path.mkdir(parents=True, exist_ok=True)
-
-    start_time = time.time()
-    metrics = world.evaluate(
-        dataset=dataset,
-        start_steps=eval_start_idx.tolist(),
-        goal_offset=cfg.eval.goal_offset_steps,
-        eval_budget=cfg.eval.eval_budget,
-        episodes_idx=eval_episodes.tolist(),
-        callables=OmegaConf.to_container(
-            cfg.eval.get("callables"),
-            resolve=True,
-        ),
-        video=results_path,
-    )
-    end_time = time.time()
-
-    print(metrics)
-
-    output_path = results_path / cfg.output.filename
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with output_path.open("a") as f:
-        f.write("\n")
-        f.write("==== CONFIG ====\n")
-        f.write(OmegaConf.to_yaml(cfg))
-        f.write("\n")
-        f.write("==== RESULTS ====\n")
-        f.write(f"metrics: {metrics}\n")
-        f.write(f"evaluation_time: {end_time - start_time} seconds\n")
-        f.write(
-            "planner: ExplicitGradientSolver (Sequential with Langevin & Norm); "
-            "objective: mean((final_pred_emb - goal_emb)^2); "
-            "gradient: torch.autograd.grad\n"
-        )
+        f.write("==== RESULTS ====\n")
+        f.write(f"metrics: {metrics}\n")
+        f.write(f"evaluation_time: {end_time - start_time} seconds\n")
 
 
 if __name__ == "__main__":
-    run()
+    run()
