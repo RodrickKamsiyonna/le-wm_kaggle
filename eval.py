@@ -38,7 +38,7 @@ def _patched_init_action(self, n_envs, actions=None):
             device=self.device,
             dtype=self.dtype,
         )
-        * 0.1
+        * 0.01
     )
     if hasattr(self, "init") and self.init.shape == actions.shape:
         self.init.copy_(actions)
