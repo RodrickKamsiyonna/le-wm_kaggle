@@ -79,23 +79,57 @@ class ExplicitGradientSolver:
             if hasattr(config, "horizon"):
                 self._horizon = int(config.horizon)
 
+        # FIX #9 (supersedes FIX #5): get the model's real macro-action dim
+        # FIRST, since it's the one piece of ground truth we can fully trust.
+        known_action_dim = self._infer_action_encoder_dim()
+
         if action_space is not None and hasattr(action_space, "shape") and len(action_space.shape) > 0:
             env_dim = int(np.prod(action_space.shape))
-            # FIX #5: previously `if env_dim <= 10: self._single_action_dim = env_dim`
-            # silently ignored the real env action dim whenever it exceeded 10,
-            # which could mask config mismatches. The env's reported dim is
-            # ground truth, so trust it always; just warn if it looks off.
-            if env_dim > 10:
-                print(
-                    f"[ExplicitGradientSolver] Warning: action_space dim={env_dim} is "
-                    "larger than the usual expected range (<=10). Using it anyway — "
-                    "verify this matches raw_action_dim."
-                )
-            self._single_action_dim = env_dim
 
-        self._action_dim = self._infer_action_encoder_dim() or (
-            self._single_action_dim * self._action_block
-        )
+            # FIX #5 turned out to be unsafe: blindly trusting
+            # `action_space.shape` as "the raw per-step action dim" broke
+            # in practice. A real run against this checkpoint reported
+            # env action_space dim=100 — but the model's real macro-action
+            # dim (from action_encoder.patch_embed.in_channels) is 10 under
+            # action_block=5, and 100 doesn't evenly divide into (or out
+            # of) 10 in any way that could make it a raw per-step dim. For
+            # this env, action_space.shape evidently does NOT represent a
+            # single raw action (likely a chunked/flattened space instead).
+            #
+            # Silently overwriting `_single_action_dim` with that bogus 100
+            # had a real, silent downstream effect: `_adapt_action_tensor`'s
+            # action_history grouping only fires when
+            # `current_feat == self._single_action_dim`, so the corrupted
+            # value (100) never matched the true per-step tensor width (2),
+            # and every episode silently fell back to the cruder "tile one
+            # action 5x" path instead of correctly grouping consecutive
+            # real actions — with no error, just a warning easy to miss
+            # across 50 episodes of log spam.
+            #
+            # Now: only trust env_dim when it's actually consistent with
+            # what the model expects (i.e. it evenly divides the model's
+            # macro-action dim). Otherwise keep the explicitly-configured
+            # raw_action_dim and warn loudly instead of overwriting it.
+            macro_dim = known_action_dim or (self._single_action_dim * self._action_block)
+            if env_dim == self._single_action_dim:
+                pass  # already consistent, nothing to change
+            elif env_dim > 0 and macro_dim % env_dim == 0:
+                self._single_action_dim = env_dim
+            else:
+                print(
+                    f"[ExplicitGradientSolver] Warning: env action_space reports "
+                    f"dim={env_dim}, which is inconsistent with this model's "
+                    f"macro-action dim ({macro_dim}) under action_block="
+                    f"{self._action_block} — {env_dim} does not evenly divide "
+                    f"{macro_dim}, so it can't be this checkpoint's raw "
+                    "per-step action dim. This usually means action_space.shape "
+                    "for this env doesn't represent a single raw action. Keeping "
+                    f"the configured raw_action_dim={self._single_action_dim} "
+                    "instead of overwriting it — verify this is correct for "
+                    "your environment."
+                )
+
+        self._action_dim = known_action_dim or (self._single_action_dim * self._action_block)
 
     def _infer_action_encoder_dim(self):
         """Read the model's real expected action-feature dim, if possible.
