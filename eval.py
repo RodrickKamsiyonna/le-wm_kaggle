@@ -49,13 +49,9 @@ class ExplicitGradientSolver:
         self._horizon = int(horizon)
         self._single_action_dim = int(raw_action_dim)
 
-        action_encoder = getattr(self.model, "action_encoder", None)
-        encoder_in_dim = getattr(action_encoder, "in_features", None) if action_encoder is not None else None
-
-        if encoder_in_dim is not None:
-            self._action_dim = int(encoder_in_dim)
-        else:
-            self._action_dim = self._single_action_dim * self._action_block
+        self._action_dim = self._infer_action_encoder_dim() or (
+            self._single_action_dim * self._action_block
+        )
 
         self._n_envs = None
         self._configured = True
@@ -85,15 +81,57 @@ class ExplicitGradientSolver:
 
         if action_space is not None and hasattr(action_space, "shape") and len(action_space.shape) > 0:
             env_dim = int(np.prod(action_space.shape))
-            if env_dim <= 10:
-                self._single_action_dim = env_dim
+            # FIX #5: previously `if env_dim <= 10: self._single_action_dim = env_dim`
+            # silently ignored the real env action dim whenever it exceeded 10,
+            # which could mask config mismatches. The env's reported dim is
+            # ground truth, so trust it always; just warn if it looks off.
+            if env_dim > 10:
+                print(
+                    f"[ExplicitGradientSolver] Warning: action_space dim={env_dim} is "
+                    "larger than the usual expected range (<=10). Using it anyway — "
+                    "verify this matches raw_action_dim."
+                )
+            self._single_action_dim = env_dim
 
+        self._action_dim = self._infer_action_encoder_dim() or (
+            self._single_action_dim * self._action_block
+        )
+
+    def _infer_action_encoder_dim(self):
+        """Read the model's real expected action-feature dim, if possible.
+
+        FIX #8: the previous code did
+            `getattr(action_encoder, "in_features", None)`
+        but `action_encoder` is a `module.Embedder`, a plain `nn.Module`
+        with no `.in_features` attribute (that's an `nn.Linear` thing) — so
+        this always silently returned None and fell through to the guessed
+        formula `raw_action_dim * action_block` below, every time, with no
+        indication that the "read it from the model" path never actually
+        ran. The real ground-truth input dim lives on the Conv1d inside
+        `Embedder.patch_embed.in_channels`. If eval-time `action_block` /
+        `raw_action_dim` ever drift from what the checkpoint was trained
+        with, this now catches the mismatch instead of silently guessing.
+        """
         action_encoder = getattr(self.model, "action_encoder", None)
-        encoder_in_dim = getattr(action_encoder, "in_features", None) if action_encoder is not None else None
-        if encoder_in_dim is not None:
-            self._action_dim = int(encoder_in_dim)
-        else:
-            self._action_dim = self._single_action_dim * self._action_block
+        if action_encoder is None:
+            return None
+        patch_embed = getattr(action_encoder, "patch_embed", None)
+        in_channels = getattr(patch_embed, "in_channels", None) if patch_embed is not None else None
+        if in_channels is None:
+            return None
+
+        in_channels = int(in_channels)
+        guessed = self._single_action_dim * self._action_block
+        if in_channels != guessed:
+            print(
+                f"[ExplicitGradientSolver] Warning: action_encoder expects "
+                f"{in_channels}-dim actions, but raw_action_dim * action_block "
+                f"= {self._single_action_dim} * {self._action_block} = {guessed}. "
+                "Using the model's real value; double-check your eval config "
+                "(action_block / raw_action_dim) against how this checkpoint "
+                "was trained (frameskip / action_dim)."
+            )
+        return in_channels
 
     @property
     def n_envs(self):
@@ -143,7 +181,24 @@ class ExplicitGradientSolver:
                 sliced[k] = v
         return sliced
 
-    def _adapt_action_tensor(self, x: torch.Tensor) -> torch.Tensor:
+    def _adapt_action_tensor(self, x: torch.Tensor, *, allow_grouping: bool = False) -> torch.Tensor:
+        """Reshape an action tensor to match the model's expected action_dim.
+
+        FIX #3: `allow_grouping=True` is used for `action_history`. If x holds
+        raw per-step actions (last dim == raw_action_dim) and the model
+        expects macro-actions covering `action_block` consecutive raw steps
+        (action_dim == raw_action_dim * action_block), we GROUP consecutive
+        real actions together via reshape rather than repeating a single
+        step `action_block` times. Repeating one action fabricates a context
+        the model never saw in training, where each macro-action slot held
+        `action_block` genuinely distinct raw actions concatenated together
+        (see train.py: effective_act_dim = frameskip * action_dim).
+
+        The old tile/pad/truncate behavior is kept as a fallback for cases
+        that aren't real grouping (e.g. adapting a single already-current
+        action, or the optimization variable's init), but now prints a
+        warning since it's a best-effort guess, not a reconstruction.
+        """
         x = x.to(self.device)
         if x.ndim == 2:
             x = x.unsqueeze(1)
@@ -156,8 +211,37 @@ class ExplicitGradientSolver:
         if current_feat == target_feat:
             return x
 
+        if (
+            allow_grouping
+            and current_feat == self._single_action_dim
+            and target_feat % current_feat == 0
+        ):
+            block = target_feat // current_feat
+            b, t, d = x.shape
+            drop = t % block
+            if drop != 0:
+                print(
+                    f"[ExplicitGradientSolver] Warning: action_history length {t} is not "
+                    f"divisible by action_block={block}; dropping the oldest {drop} "
+                    "step(s) before grouping. Verify this matches how the environment "
+                    "reports action_history."
+                )
+                x = x[:, drop:]
+                t -= drop
+            # Group every `block` consecutive raw actions into one
+            # macro-action, matching how the training dataset packs
+            # `frameskip` consecutive raw actions per macro-step.
+            return x.reshape(b, t // block, d * block)
+
         if target_feat % current_feat == 0:
             repeat_factor = target_feat // current_feat
+            print(
+                "[ExplicitGradientSolver] Warning: tiling a single action "
+                f"{repeat_factor}x to fill action_dim={target_feat}. This is a "
+                "best-effort fallback, not a reconstruction of action_block "
+                "consecutive actions — verify this is the intended semantics "
+                "for this tensor."
+            )
             return x.repeat(1, 1, repeat_factor)
 
         if current_feat > target_feat:
@@ -175,6 +259,10 @@ class ExplicitGradientSolver:
             "truncated",
             "_needs_flush",
             "action_history",
+            # FIX #7: "action" is handled explicitly below (adapted/grouped),
+            # so it no longer gets an initial throwaway write here that would
+            # just be overwritten.
+            "action",
         }
 
         for key, value in info_dict.items():
@@ -183,7 +271,7 @@ class ExplicitGradientSolver:
 
         if "action_history" in info_dict:
             hist = self._move_to_device(info_dict["action_history"])
-            hist = self._adapt_action_tensor(hist)
+            hist = self._adapt_action_tensor(hist, allow_grouping=True)
 
             current = info_dict.get("action")
             if current is not None and torch.is_tensor(current):
@@ -285,15 +373,21 @@ class ExplicitGradientSolver:
     # ---------------------------------------------------------------------
     # Latent objective for a single sequence
     # ---------------------------------------------------------------------
-    def _latent_energy(self, context_data: dict, goal_data: dict, act_seq: torch.Tensor):
+    def _encode_context_and_goal(self, context_data: dict, goal_data: dict):
+        """Encode context + goal ONCE per episode.
+
+        FIX #4: the original `_latent_energy` re-ran `self.model.encode(...)`
+        on both context and goal inside the per-gradient-step loop, even
+        though neither changes during optimization — that's a full vision
+        encoder forward pass wasted `n_steps` times per episode. Now called
+        once, outside the optimization loop.
+        """
         with torch.no_grad():
             ctx_output = self.model.encode(context_data)
-            ctx_emb = ctx_output["emb"]
-            ctx_act = ctx_output["act_emb"]
-
             goal_output = self.model.encode(goal_data)
-            goal_emb = goal_output["emb"][:, -1]
+        return ctx_output["emb"], ctx_output["act_emb"], goal_output["emb"][:, -1]
 
+    def _latent_energy(self, ctx_emb, ctx_act, goal_emb, act_seq: torch.Tensor):
         act_emb_seq = self.model.action_encoder(act_seq)
 
         current_ctx_emb = ctx_emb
@@ -335,10 +429,13 @@ class ExplicitGradientSolver:
         goal = self._build_goal(ep_info)
         actions = self._initial_action(batch_size=1, init_action=ep_init_action)
 
+        # FIX #4: encode context/goal once, reuse across all n_steps.
+        ctx_emb, ctx_act, goal_emb = self._encode_context_and_goal(context, goal)
+
         energy_history = []
 
         for _ in range(self.n_steps):
-            energy = self._latent_energy(context, goal, actions)
+            energy = self._latent_energy(ctx_emb, ctx_act, goal_emb, actions)
 
             grad_energy = torch.autograd.grad(
                 energy,
@@ -371,7 +468,7 @@ class ExplicitGradientSolver:
 
             actions.requires_grad_(True)
 
-        final_energy = self._latent_energy(context, goal, actions)
+        final_energy = self._latent_energy(ctx_emb, ctx_act, goal_emb, actions)
         energy_history.append(float(final_energy.detach().cpu().item()))
 
         return actions.detach().cpu(), energy_history
@@ -504,6 +601,10 @@ def run(cfg: DictConfig):
 
         processor = preprocessing.StandardScaler()
         col_data = stats_dataset.get_col_data(col)
+        # FIX #6: `np.isnan(col_data).any(axis=1)` assumes col_data is 2-D.
+        # A scalar/1-D cached column would raise here; reshape defensively.
+        if col_data.ndim == 1:
+            col_data = col_data.reshape(-1, 1)
         col_data = col_data[~np.isnan(col_data).any(axis=1)]
         processor.fit(col_data)
         process[col] = processor
@@ -515,6 +616,7 @@ def run(cfg: DictConfig):
 
     if policy_name == "random":
         policy = swm.policy.RandomPolicy()
+        ckpt_path = None
     else:
         ckpt_path = policy_name
         if not ckpt_path.endswith(".ckpt"):
@@ -563,8 +665,14 @@ def run(cfg: DictConfig):
             transform=transform,
         )
 
+    # FIX #2: results_path used to be derived from
+    # `get_cache_dir()/policy_name`.parent, which has no real relationship
+    # to where the checkpoint was actually loaded from. Now it's tied
+    # directly to the checkpoint's own directory (or this file's directory
+    # for the random baseline), so outputs land next to the model that
+    # produced them.
     results_path = (
-        Path(swm.data.utils.get_cache_dir(), policy_name).parent
+        Path(ckpt_path).resolve().parent
         if policy_name != "random"
         else Path(__file__).parent
     )
@@ -587,8 +695,11 @@ def run(cfg: DictConfig):
     print(valid_mask.sum(), "valid starting points found for evaluation.")
 
     g = np.random.default_rng(cfg.seed)
+    # FIX #1: `len(valid_indices) - 1` excluded the last valid starting
+    # point from ever being sampled (np.random.Generator.choice(n, ...)
+    # samples from range(n)). Use the full length.
     random_episode_indices = g.choice(
-        len(valid_indices) - 1,
+        len(valid_indices),
         size=cfg.eval.num_eval,
         replace=False,
     )
