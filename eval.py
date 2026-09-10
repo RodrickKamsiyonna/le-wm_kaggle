@@ -23,7 +23,6 @@ from torchvision.transforms import v2 as transforms
 #
 # This patch ensures the action tensor is created directly with the solver
 # dtype/device before it is registered as the optimization parameter.
-# ---------------------------------------------------------------------------
 def _patched_init_action(self, n_envs, actions=None):
     if actions is None:
         actions = torch.zeros(
@@ -31,33 +30,32 @@ def _patched_init_action(self, n_envs, actions=None):
             dtype=self.dtype,
         )
 
-    remaining = self.horizon - actions.shape[1]
+    actions = actions.to(self.device)
+
+    # Add the sample dimension to whatever warm-started actions we already have:
+    # [n_envs, t, action_dim] -> [n_envs, num_samples, t, action_dim]
+    actions = actions.unsqueeze(1).repeat_interleave(self.num_samples, dim=1)
+
+    remaining = self.horizon - actions.shape[2]
 
     if remaining > 0:
-        new_actions = torch.zeros(
+        # Match the training-time noise prior from lejepa_forward:
+        #   eps = torch.randn_like(ctx_actions_raw)          # eps ~ N(0, I)
+        #   act_gamma = gamma * ctx_actions_raw + (1 - gamma) * eps
+        # At gamma=0 the model only ever sees pure eps, so N(0, I) is the
+        # correct "no information yet" init — not zeros. Sampling directly
+        # at (n_envs, num_samples, ...) also gives each of the num_samples
+        # candidates its own independent draw, instead of one draw repeated.
+        new_actions = torch.randn(
             n_envs,
+            self.num_samples,
             remaining,
             self.action_dim,
             dtype=self.dtype,
+            device=self.device,
         )
 
-        actions = torch.cat([actions, new_actions], dim=1)
-
-    # Make absolutely sure the tensor is on the solver device.
-    actions = actions.to(self.device)
-
-    # Add the sample dimension:
-    #
-    # Before:
-    #   [n_envs, horizon, action_dim]
-    #
-    # After:
-    #   [n_envs, num_samples, horizon, action_dim]
-    actions = (
-        actions
-        .unsqueeze(1)
-        .repeat_interleave(self.num_samples, dim=1)
-    )
+        actions = torch.cat([actions, new_actions], dim=2)
 
     # Reuse existing parameter storage when possible.
     if hasattr(self, "init") and self.init.shape == actions.shape:
